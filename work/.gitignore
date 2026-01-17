@@ -1,0 +1,4 @@
+# runtime state / logs
+logs/
+state.json
+STATUS.md

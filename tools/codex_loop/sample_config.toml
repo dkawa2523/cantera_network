@@ -1,0 +1,25 @@
+# ~/.codex/config.toml (サンプル)
+# このファイルは「例」です。実環境に合わせて調整してください。
+# 詳細は OpenAI Codex docs の Basic/Advanced/Reference を参照。
+
+# --- Global defaults ---
+# approval_policy: untrusted | on-failure | on-request | never
+approval_policy = "on-request"
+
+# sandbox_mode: read-only | workspace-write | danger-full-access
+sandbox_mode = "workspace-write"
+
+# model は任意。組織の標準に合わせること。
+# model = "gpt-5.2"
+
+# --- Profiles (optional) ---
+# 自動ループで「承認プロンプトで止まる」ことを避けたい場合の例。
+# ただし安全性は下がるので、必ず隔離環境/ポリシーに従うこと。
+
+[profiles.auto_loop]
+approval_policy = "never"
+sandbox_mode = "workspace-write"
+# NOTE: workspace-write ではデフォルトで network access は off
+# 必要なら下記（非推奨）
+# [sandbox_workspace_write]
+# network_access = true
