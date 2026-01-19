@@ -162,9 +162,14 @@ def run_shell_commands(repo_root: Path, commands: List[str]) -> VerificationResu
 
     out_lines: List[str] = []
     for cmd in commands:
-        out_lines.append(f"$ {cmd}\n")
+        effective_cmd = cmd
+        stripped = cmd.strip()
+        if stripped == "python" or stripped.startswith("python "):
+            if shutil.which("python") is None and shutil.which("python3") is not None:
+                effective_cmd = "python3" + stripped[len("python"):]
+        out_lines.append(f"$ {effective_cmd}\n")
         p = subprocess.run(
-            cmd,
+            effective_cmd,
             shell=True,
             cwd=str(repo_root),
             text=True,
@@ -190,6 +195,56 @@ def ensure_exists(repo_root: Path, rel: Path) -> Path:
     return p
 
 
+
+
+def validate_output_schema(schema_path: Path) -> None:
+    # Codex output schema is strict: for any object, 'required' must include every key in 'properties'.
+    obj = load_json(schema_path)
+
+    def check(node: Any, where: str) -> None:
+        if isinstance(node, dict):
+            if node.get('type') == 'object':
+                props = node.get('properties') or {}
+                req = node.get('required')
+                if not isinstance(req, list):
+                    raise ValueError(f"{where}: missing/invalid required list")
+                missing = [k for k in props.keys() if k not in req]
+                if missing:
+                    raise ValueError(f"{where}: required missing keys: {missing}")
+                for k, v in props.items():
+                    check(v, where + f".properties.{k}")
+            if 'items' in node:
+                check(node['items'], where + '.items')
+
+    check(obj, '$')
+
+
+def _ensure_codex_auth(codex_home: Path, env: Dict[str, str]) -> None:
+    auth_env_keys = (
+        "OPENAI_API_KEY",
+        "OPENAI_ACCESS_TOKEN",
+        "OPENAI_API_TOKEN",
+        "CODEX_API_KEY",
+    )
+    if any(env.get(k) for k in auth_env_keys):
+        return
+
+    auth_path = codex_home / "auth.json"
+    config_path = codex_home / "config.toml"
+    home_codex = Path.home() / ".codex"
+    home_auth = home_codex / "auth.json"
+    home_config = home_codex / "config.toml"
+
+    try:
+        if home_auth.exists() and not auth_path.exists():
+            shutil.copy2(home_auth, auth_path)
+            os.chmod(auth_path, 0o600)
+        if home_config.exists() and not config_path.exists():
+            shutil.copy2(home_config, config_path)
+            os.chmod(config_path, 0o600)
+    except Exception:
+        # Best effort: avoid failing the loop if auth sync is not possible.
+        return
 def build_prompt(repo_root: Path, task_path: Path) -> str:
     wrapper = read_text(ensure_exists(repo_root, WRAPPER_PATH))
     task_md = read_text(task_path)
@@ -220,12 +275,23 @@ def run_codex(
     # Force JSON-shaped final response
     cmd += ["--output-schema", str(repo_root / SCHEMA_PATH), "--output-last-message", str(last_msg_path), "-"]
 
+    env = os.environ.copy()
+    if "CODEX_HOME" in env:
+        codex_home = Path(env["CODEX_HOME"]).expanduser()
+    else:
+        codex_home = repo_root / ".codex"
+        # Keep Codex session files inside the repo to avoid home-dir permission issues.
+        env["CODEX_HOME"] = str(codex_home)
+    codex_home.mkdir(parents=True, exist_ok=True)
+    _ensure_codex_auth(codex_home, env)
+
     try:
         proc = subprocess.run(
             cmd,
             input=prompt,
             text=True,
             cwd=str(repo_root),
+            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
@@ -291,6 +357,15 @@ def main() -> int:
     args = ap.parse_args()
 
     repo_root = Path(args.repo_root).resolve() if args.repo_root else find_repo_root(Path.cwd())
+    # Validate Codex output schema early to avoid opaque 400 errors from the API
+    schema_file = repo_root / SCHEMA_PATH
+    try:
+        validate_output_schema(schema_file)
+    except Exception as e:
+        print(f"ERROR: invalid Codex output schema at {schema_file}: {e}", file=sys.stderr)
+        print("HINT: Ensure tools/codex_loop/response_schema.json includes verification.required=['commands','passed','notes']", file=sys.stderr)
+        return 2
+
     queue = load_queue(repo_root)
     state = load_state(repo_root)
 

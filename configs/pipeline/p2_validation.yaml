@@ -1,0 +1,30 @@
+{
+  "name": "p2_validation",
+  "steps": [
+    {
+      "id": "sim",
+      "task": "sim.run",
+      "sim": {
+        "name": "dummy",
+        "time": {"start": 0.0, "stop": 1.0, "steps": 2},
+        "initial": {"T": 900.0, "P": 101325.0},
+        "ramp": {"T": 5.0, "P": 100.0},
+        "species": ["A", "B", "C"],
+        "outputs": {"include_rop": false, "include_wdot": false}
+      }
+    },
+    {
+      "id": "observables",
+      "task": "observables.run",
+      "inputs": {"run_id": "@sim"},
+      "params": {
+        "observables": [
+          {
+            "name": "gas_composition",
+            "params": {"stats": ["mean"], "species": ["A"]}
+          }
+        ]
+      }
+    }
+  ]
+}

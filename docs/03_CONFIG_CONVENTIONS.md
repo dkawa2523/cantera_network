@@ -28,7 +28,7 @@ configs/
 - `task/*`: カテゴリ単体の設定
 - `pipeline/*`: step列（taskを並べる）
 
-> TODO: 既存リポジトリで `conf/` や `config/` が使われている場合、衝突を避けるため `configs/` に寄せる。
+> 現時点このリポジトリには `conf/` や `config/` ディレクトリは存在しない。外部既存リポジトリで使われている場合は、衝突を避けるため `configs/` に寄せる。
 
 ## 2. 上書き（override）規約
 - CLI overrideは Hydra 標準に従う
@@ -51,4 +51,3 @@ configs/
 ## 6. “入力編集→実行→出力→可視化” を YAMLで回す
 - `sim` は単体でも `rxn sim run sim=...` のように実行可能
 - `pipeline` では `steps` により同じRunArtifactを再利用しながら downstream を実行
-

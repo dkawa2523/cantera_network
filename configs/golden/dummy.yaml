@@ -1,0 +1,80 @@
+tolerances:
+  abs: 1.0e-6
+  rel: 1.0e-6
+
+conditions:
+  - id: dummy_base
+    sim:
+      name: dummy
+      time:
+        start: 0.0
+        stop: 1.0
+        steps: 3
+      initial:
+        T: 900.0
+        P: 101325.0
+      ramp:
+        T: 5.0
+        P: 100.0
+      species:
+        - A
+        - B
+        - C
+      outputs:
+        include_wdot: true
+    observables:
+      - name: gas_composition
+        params:
+          stats:
+            - mean
+            - max
+      - name: film_thickness
+        params:
+          proxy:
+            data_var: net_production_rates
+            species: A
+    features:
+      - name: timeseries_summary
+        params:
+          variables:
+            - T
+            - P
+          stats:
+            - mean
+            - max
+    expected:
+      observables:
+        - name: gas.A.mean
+          value: 0.3301072565778448
+          unit: mole_fraction
+        - name: gas.A.max
+          value: 0.3333333333333333
+          unit: mole_fraction
+        - name: gas.B.mean
+          value: 0.3333333333333333
+          unit: mole_fraction
+        - name: gas.B.max
+          value: 0.3333333333333333
+          unit: mole_fraction
+        - name: gas.C.mean
+          value: 0.33655941008882184
+          unit: mole_fraction
+        - name: gas.C.max
+          value: 0.33974358974358976
+          unit: mole_fraction
+        - name: film.thickness
+          value: 0.002
+          unit: arb*s
+      features:
+        - name: T.mean
+          value: 905.0
+          unit: K
+        - name: T.max
+          value: 910.0
+          unit: K
+        - name: P.mean
+          value: 101425.0
+          unit: Pa
+        - name: P.max
+          value: 101525.0
+          unit: Pa

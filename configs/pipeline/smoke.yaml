@@ -1,0 +1,5 @@
+name: smoke
+steps:
+  - id: sim
+    task: sim.run
+    sim: ${sim}

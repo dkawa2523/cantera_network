@@ -55,12 +55,14 @@ artifacts/
       index.html
 ```
 
-> TODO: 既存リポジトリに `runs/` など既存ディレクトリがある場合、衝突回避のため `artifacts/` への集約を優先。移行手順は別タスクで扱う。
+> 現時点このリポジトリには `runs/` など既存ディレクトリが存在しない。外部既存リポジトリを統合する場合は、衝突回避のため `artifacts/` への集約を優先する（移行手順は別タスクで扱う）。
 
 ## 3. Artifact ID（命名）
 - **再現性のため hash-based を推奨**
 - `id = sha256(canonical_json(inputs + config + code_version)).hexdigest()[:16]`
 - 人間が読むために任意の `tag` を manifest に持ってよい（IDには入れない）
+- Hash input should be canonicalized (sorted keys, list/tuple normalized, Path to string, numpy scalars to Python).
+- Transient config keys (e.g., logging/hydra) may be excluded from hashing via an explicit exclude list.
 
 ## 4. manifest.yaml（共通スキーマ）
 最小必須フィールド（拡張可）:
@@ -77,6 +79,7 @@ code:
   git_commit: "<optional>"
   dirty: false
   version: "<optional>"
+provenance: {}       # 実行環境メタデータ（python/OS など）
 notes: "<free text>"
 ```
 
@@ -95,8 +98,9 @@ notes: "<free text>"
 - `T`, `P`（time軸）
 - `X`（mole fraction）, `C`（concentration）いずれか
 - 反応寄与:
-  - `rop_net`（reaction×time×phase）
-  - `net_production_rates`（species×time×phase）
+  - `rop_net` (time x reaction; phase optional)
+  - `net_production_rates` (time x species; phase optional)
+  - `creation_rates` / `destruction_rates` (time x species; phase optional)
 - 表面:
   - `coverage`（surface_species×time）
 
@@ -112,6 +116,7 @@ notes: "<free text>"
 ### 6.1 Scalar / Vector 観測（推奨）
 - `values.parquet`（縦持ち）
   - columns: `run_id`, `observable`, `value`, `unit`, `meta_json`
+- Parquet writer が無い環境では `values.json`（同一列定義）を併用して保存する場合がある。
 
 ### 6.2 High-dimensional 観測（将来）
 - 画像/動画/空間分布は `zarr` とし、manifestに `shape`, `dtype`, `axes` を記録。
@@ -132,8 +137,8 @@ notes: "<free text>"
   - `target`（膜厚など対象観測）
   - `reaction_id` / `species`
   - `value`, `unit`, `meta_json`
+- Parquet writer が無い環境では `features.json` / `sensitivity.json`（同一列定義）を併用して保存する場合がある。
 
 ## 9. Reduction / Validation / Report
 - 縮退は「パッチ」として保存（元機構を破壊しない）
 - 妥当性評価は、対象パイプラインと許容誤差を manifest に持つ
-

@@ -10,3 +10,6 @@
 - タスクの Verification コマンドが通るまで修正する
 
 出力は **JSONのみ** で、`tools/codex_loop/response_schema.json` に適合させてください。
+
+
+重要: 出力JSONの verification.notes は必須です（空文字でも良いので必ず入れる）。

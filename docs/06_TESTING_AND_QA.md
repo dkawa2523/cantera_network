@@ -23,6 +23,7 @@
   - 主要ROPランキング
   - 縮退前後の誤差が許容範囲内か
 - 許容誤差は config で明示し、manifest に記録
+  - 例: `configs/golden/dummy.yaml` に期待値と許容誤差を定義し、`tests/test_golden_suite_dummy.py` で検証
 
 ## 2. doctor コマンド（運用）
 - `doctor` は環境・設定・最小実行ができることを検査する
@@ -37,4 +38,4 @@
   - unit tests
   - dummy integration test
 
-> TODO: 既存リポジトリのCI状況（GitHub Actions等）を確認し、最小の追加で統合する。
+> 現時点このリポジトリには CI 設定（GitHub Actions等）が存在しない。外部既存リポジトリがある場合は状況を確認し、最小の追加で統合する。

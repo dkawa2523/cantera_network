@@ -1,0 +1,16 @@
+inputs:
+  run_id: "<run_id>"
+params:
+  observables:
+    - name: film_thickness
+      params:
+        rate_vars:
+          - deposition_rate
+          - film_growth_flux
+        proxy:
+          data_var: net_production_rates
+          species: "<species>"
+          sign: -1.0
+        scale: 1.0
+        unit: ""
+  missing_strategy: nan

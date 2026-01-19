@@ -1,0 +1,114 @@
+name: p2_smoke
+steps:
+  - id: opt
+    task: optimization.random_search
+    sim: ${sim}
+    observables:
+      observables:
+        - name: gas_composition
+          params:
+            stats:
+              - mean
+            species:
+              - A
+    params:
+      samples: 3
+      objective:
+        target: gas.A.mean
+        direction: min
+      search_space:
+        multipliers:
+          - index: 0
+            low: 0.8
+            high: 1.2
+          - index: 1
+            low: 0.8
+            high: 1.2
+
+  - id: assim
+    task: assimilation.eki
+    sim: ${sim}
+    observables:
+      observables:
+        - name: gas_composition
+          params:
+            stats:
+              - mean
+            species:
+              - A
+    assimilation:
+      parameters:
+        - index: 0
+          name: m0
+          prior:
+            type: uniform
+            low: 0.8
+            high: 1.2
+        - index: 1
+          name: m1
+          prior:
+            type: uniform
+            low: 0.8
+            high: 1.2
+      observed:
+        - observable: gas.A.mean
+          value: 0.33
+          weight: 1.0
+          noise: 0.1
+      params:
+        ensemble_size: 3
+        iterations: 2
+        ridge: 1.0e-6
+
+  - id: sensitivity
+    task: sensitivity.multiplier_fd
+    sim: ${sim}
+    params:
+      reactions:
+        - R1
+        - R2
+      observables:
+        - name: gas_composition
+          params:
+            stats:
+              - mean
+            species:
+              - A
+      targets:
+        - gas.A.mean
+      eps: 0.05
+      definition: dlogk
+      rank_by: abs
+
+  - id: reduction
+    task: reduction.threshold_prune
+    inputs:
+      sensitivity: "@sensitivity"
+    threshold:
+      top_k: 1
+
+  - id: validation
+    task: reduction.validate
+    inputs:
+      patches:
+        - "@reduction"
+    mechanism: configs/mechanism/dummy_minimal.yaml
+    validation:
+      pipeline: p2_validation
+      metric: abs
+      tolerance: 0.0
+      sim_step_id: sim
+      observables_step_id: observables
+
+  - id: benchmark
+    task: viz.benchmark_report
+    name: benchmark_report
+    title: P2 Smoke Benchmark
+    dashboard: benchmark
+    inputs:
+      optimization:
+        - "@opt"
+      validation:
+        - "@validation"
+      assimilation:
+        - "@assim"

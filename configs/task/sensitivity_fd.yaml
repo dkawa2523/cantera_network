@@ -1,0 +1,14 @@
+name: sensitivity.multiplier_fd
+sim: ${sim}
+params:
+  reactions:
+    - "<reaction_id_or_index>"
+  observables:
+    - name: "<observable_name>"
+      params: {}
+  targets:
+    - "<observable_output_name>"
+  eps: 0.01
+  definition: dlogk
+  rank_by: abs
+  missing_strategy: nan

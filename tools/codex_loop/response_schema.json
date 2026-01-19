@@ -3,21 +3,62 @@
   "type": "object",
   "additionalProperties": false,
   "properties": {
-    "task_id": {"type": "string"},
-    "status": {"type": "string", "enum": ["done", "needs_retry", "blocked"]},
-    "summary": {"type": "string"},
-    "changes": {"type": "array", "items": {"type": "string"}},
+    "task_id": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "done",
+        "needs_retry",
+        "blocked"
+      ]
+    },
+    "summary": {
+      "type": "string"
+    },
+    "changes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
     "verification": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "commands": {"type": "array", "items": {"type": "string"}},
-        "passed": {"type": "boolean"},
-        "notes": {"type": "string"}
+        "commands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "passed": {
+          "type": "boolean"
+        },
+        "notes": {
+          "type": "string"
+        }
       },
-      "required": ["commands", "passed"]
+      "required": [
+        "commands",
+        "passed",
+        "notes"
+      ]
     },
-    "risks_todos": {"type": "array", "items": {"type": "string"}}
+    "risks_todos": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
   },
-  "required": ["task_id", "status", "summary", "changes", "verification", "risks_todos"]
+  "required": [
+    "task_id",
+    "status",
+    "summary",
+    "changes",
+    "verification",
+    "risks_todos"
+  ]
 }

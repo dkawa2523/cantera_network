@@ -1,0 +1,18 @@
+{
+  "phases": [
+    {
+      "name": "gas",
+      "thermo": "ideal-gas",
+      "species": ["A", "B"],
+      "reactions": "all"
+    }
+  ],
+  "species": [
+    {"name": "A"},
+    {"name": "B"}
+  ],
+  "reactions": [
+    {"id": "R1", "equation": "A => B", "rate-constant": {"A": 1.0}},
+    {"id": "R2", "equation": "B => A", "rate-constant": {"A": 0.5}}
+  ]
+}

@@ -2,7 +2,7 @@
   {
     "id": "T001",
     "priority": 0,
-    "status": "todo",
+    "status": "done",
     "title": "Repo reconnaissance: 既存Cantera実行例/出力/構造を調査し docs TODO を埋める",
     "path": "work/tasks/T001_repo_reconnaissance.md",
     "skills": [
@@ -18,7 +18,7 @@
   {
     "id": "T002",
     "priority": 0,
-    "status": "todo",
+    "status": "done",
     "title": "Bootstrap scaffold: package骨格・artifacts/work/configs/tests最小整備",
     "path": "work/tasks/T002_bootstrap_scaffold.md",
     "skills": [
@@ -36,7 +36,7 @@
   {
     "id": "T003",
     "priority": 0,
-    "status": "todo",
+    "status": "done",
     "title": "Core schema: Manifestモデル（pydantic）+ YAML I/O + schema_version",
     "path": "work/tasks/T003_core_manifest_schema.md",
     "skills": [
@@ -54,7 +54,7 @@
   {
     "id": "T004",
     "priority": 0,
-    "status": "todo",
+    "status": "done",
     "title": "Core IDs: config正規化・hash・run_id/artifact_idの安定生成",
     "path": "work/tasks/T004_core_id_hashing.md",
     "skills": [
@@ -72,7 +72,7 @@
   {
     "id": "T005",
     "priority": 0,
-    "status": "todo",
+    "status": "done",
     "title": "ArtifactStore v1: layout/atomic write/read/immutability enforcement",
     "path": "work/tasks/T005_artifact_store_v1.md",
     "skills": [
@@ -90,7 +90,7 @@
   {
     "id": "T006",
     "priority": 0,
-    "status": "todo",
+    "status": "done",
     "title": "ArtifactStore v2: provenance/parents/再利用キャッシュ補助API",
     "path": "work/tasks/T006_artifact_store_v2_cache.md",
     "skills": [
@@ -108,7 +108,7 @@
   {
     "id": "T007",
     "priority": 0,
-    "status": "todo",
+    "status": "done",
     "title": "Registry: backend/task/observable/feature/viz のプラグイン登録・解決",
     "path": "work/tasks/T007_registry_plugins.md",
     "skills": [
@@ -127,7 +127,7 @@
   {
     "id": "T008",
     "priority": 0,
-    "status": "todo",
+    "status": "done",
     "title": "Error/Logging policy: 例外階層・ユーザ向けエラー・ログ出力規約を実装",
     "path": "work/tasks/T008_error_logging_policy.md",
     "skills": [
@@ -145,7 +145,7 @@
   {
     "id": "T009",
     "priority": 0,
-    "status": "todo",
+    "status": "done",
     "title": "CLI v0: sim/task/pipeline/viz/doctor の枠だけ作り --help を固定",
     "path": "work/tasks/T009_cli_v0.md",
     "skills": [
@@ -164,7 +164,7 @@
   {
     "id": "T010",
     "priority": 0,
-    "status": "todo",
+    "status": "done",
     "title": "Hydra integration: config compose/override/--cfg表示 + 実行設定をmanifestへ保存",
     "path": "work/tasks/T010_hydra_integration.md",
     "skills": [
@@ -183,7 +183,7 @@
   {
     "id": "T011",
     "priority": 0,
-    "status": "todo",
+    "status": "done",
     "title": "Backend IF + DummyBackend: SimulationBackend差し替え点と超高速ダミー実装",
     "path": "work/tasks/T011_backend_dummy.md",
     "skills": [
@@ -202,7 +202,7 @@
   {
     "id": "T012",
     "priority": 0,
-    "status": "todo",
+    "status": "done",
     "title": "Task runner: registryからTaskを解決し単体実行できるrunnerを実装",
     "path": "work/tasks/T012_task_runner.md",
     "skills": [
@@ -222,7 +222,7 @@
   {
     "id": "T013",
     "priority": 0,
-    "status": "todo",
+    "status": "done",
     "title": "Pipeline runner v0: steps YAML を逐次実行しArtifactをつなぐ（最小）",
     "path": "work/tasks/T013_pipeline_runner_v0.md",
     "skills": [
@@ -240,7 +240,7 @@
   {
     "id": "T014",
     "priority": 0,
-    "status": "todo",
+    "status": "done",
     "title": "Pipeline runner v1: @id/@last参照・step timing・pipeline manifest出力",
     "path": "work/tasks/T014_pipeline_runner_v1.md",
     "skills": [
@@ -258,7 +258,7 @@
   {
     "id": "T015",
     "priority": 0,
-    "status": "todo",
+    "status": "done",
     "title": "Configs: dummy sim + smoke pipeline + task configs のサンプル追加",
     "path": "work/tasks/T015_configs_examples.md",
     "skills": [
@@ -276,7 +276,7 @@
   {
     "id": "T016",
     "priority": 0,
-    "status": "todo",
+    "status": "done",
     "title": "Tests: dummy smoke pipeline integration test（pytest）",
     "path": "work/tasks/T016_tests_smoke_dummy.md",
     "skills": [
@@ -293,7 +293,7 @@
   {
     "id": "T017",
     "priority": 0,
-    "status": "todo",
+    "status": "done",
     "title": "Doctor: 環境診断コマンド（dummy smoke含む）",
     "path": "work/tasks/T017_doctor_command.md",
     "skills": [
@@ -311,7 +311,7 @@
   {
     "id": "T018",
     "priority": 0,
-    "status": "todo",
+    "status": "done",
     "title": "Report base: ReportArtifact（HTMLテンプレ）と共通ヘッダ/メタ埋め込み",
     "path": "work/tasks/T018_report_base.md",
     "skills": [
@@ -330,7 +330,7 @@
   {
     "id": "T019",
     "priority": 0,
-    "status": "todo",
+    "status": "done",
     "title": "Artifacts CLI: artifacts ls/show/export（開発者が成果物を追える）",
     "path": "work/tasks/T019_artifacts_cli.md",
     "skills": [
@@ -349,7 +349,7 @@
   {
     "id": "T020",
     "priority": 0,
-    "status": "todo",
+    "status": "done",
     "title": "Contract validators: Run/Observable/Graph/Feature/Sensitivityの整合チェック関数",
     "path": "work/tasks/T020_contract_validators.md",
     "skills": [
@@ -368,7 +368,7 @@
   {
     "id": "T020G",
     "priority": 0,
-    "status": "todo",
+    "status": "done",
     "title": "Phase Gate P0→P1: P0全体の仕様準拠・統合テスト・修正/軽リファクタ",
     "path": "work/tasks/T020G_phase_gate_p0.md",
     "skills": [
@@ -429,7 +429,7 @@
   {
     "id": "T021",
     "priority": 1,
-    "status": "todo",
+    "status": "done",
     "title": "CanteraBackend v0: 0D実行（T/P/X, time grid）でRunArtifact生成",
     "path": "work/tasks/T021_backend_cantera_v0.md",
     "skills": [
@@ -450,7 +450,7 @@
   {
     "id": "T022",
     "priority": 1,
-    "status": "todo",
+    "status": "done",
     "title": "Cantera outputs拡張: wdot/rop_net/creation/destruction 等を可能な範囲で保存",
     "path": "work/tasks/T022_backend_cantera_outputs.md",
     "skills": [
@@ -469,7 +469,7 @@
   {
     "id": "T023",
     "priority": 1,
-    "status": "todo",
+    "status": "done",
     "title": "Cantera parameterization: reaction multipliers（摂動/無効化）適用とmanifest記録",
     "path": "work/tasks/T023_backend_cantera_multipliers.md",
     "skills": [
@@ -488,7 +488,7 @@
   {
     "id": "T024",
     "priority": 1,
-    "status": "todo",
+    "status": "done",
     "title": "sim コマンド: init/validate/run/viz（backend独立）+ キャッシュskip",
     "path": "work/tasks/T024_sim_commands.md",
     "skills": [
@@ -510,7 +510,7 @@
   {
     "id": "T025",
     "priority": 1,
-    "status": "todo",
+    "status": "done",
     "title": "Observables framework: ObservableプラグインAPI + ObservableArtifact出力",
     "path": "work/tasks/T025_observables_framework.md",
     "skills": [
@@ -530,7 +530,7 @@
   {
     "id": "T026",
     "priority": 1,
-    "status": "todo",
+    "status": "done",
     "title": "Observable: gas_composition（指定種/集約）",
     "path": "work/tasks/T026_observable_gas_composition.md",
     "skills": [
@@ -548,7 +548,7 @@
   {
     "id": "T027",
     "priority": 1,
-    "status": "todo",
+    "status": "done",
     "title": "Observable: coverage_summary（表面被覆率。無ければgraceful）",
     "path": "work/tasks/T027_observable_coverage.md",
     "skills": [
@@ -566,7 +566,7 @@
   {
     "id": "T028",
     "priority": 1,
-    "status": "todo",
+    "status": "done",
     "title": "Observable: film_thickness v0（deposition_rate積分/簡易モデル）",
     "path": "work/tasks/T028_observable_film_thickness.md",
     "skills": [
@@ -585,7 +585,7 @@
   {
     "id": "T029",
     "priority": 1,
-    "status": "todo",
+    "status": "done",
     "title": "Graphs v0: 機構からS行列（species×reaction）を作りGraphArtifact保存",
     "path": "work/tasks/T029_graphs_stoich.md",
     "skills": [
@@ -605,7 +605,7 @@
   {
     "id": "T030",
     "priority": 1,
-    "status": "todo",
+    "status": "done",
     "title": "Graphs v1: bipartite graph（species/reaction）を構築しJSON保存",
     "path": "work/tasks/T030_graphs_bipartite.md",
     "skills": [
@@ -623,7 +623,7 @@
   {
     "id": "T031",
     "priority": 1,
-    "status": "todo",
+    "status": "done",
     "title": "Graph annotation（species）: formula/elements/charge/state/phase を付与",
     "path": "work/tasks/T031_graphs_species_annotation.md",
     "skills": [
@@ -641,7 +641,7 @@
   {
     "id": "T032",
     "priority": 1,
-    "status": "todo",
+    "status": "done",
     "title": "Graph annotation（reaction）: reaction_type/order/reversible 等を付与（unknown可）",
     "path": "work/tasks/T032_graphs_reaction_annotation.md",
     "skills": [
@@ -659,7 +659,7 @@
   {
     "id": "T033",
     "priority": 1,
-    "status": "todo",
+    "status": "done",
     "title": "Graph analytics: SCC/communities/階層メトリクス算出（FeatureArtifactでも可）",
     "path": "work/tasks/T033_graphs_analytics.md",
     "skills": [
@@ -678,7 +678,7 @@
   {
     "id": "T034",
     "priority": 1,
-    "status": "todo",
+    "status": "done",
     "title": "Features framework + timeseries summary（mean/max/integral/last）",
     "path": "work/tasks/T034_features_timeseries.md",
     "skills": [
@@ -699,7 +699,7 @@
   {
     "id": "T035",
     "priority": 1,
-    "status": "todo",
+    "status": "done",
     "title": "Features: ROP/wdot summary（Top-N, time-integral）",
     "path": "work/tasks/T035_features_rop_wdot.md",
     "skills": [
@@ -718,7 +718,7 @@
   {
     "id": "T036",
     "priority": 1,
-    "status": "todo",
+    "status": "done",
     "title": "Features: graph/network metrics + 多条件安定性（rank stability等）",
     "path": "work/tasks/T036_features_network_metrics.md",
     "skills": [
@@ -737,7 +737,7 @@
   {
     "id": "T037",
     "priority": 1,
-    "status": "todo",
+    "status": "done",
     "title": "Sensitivity v0: multiplier finite-diff で target（Observable）感度を算出",
     "path": "work/tasks/T037_sensitivity_multiplier_fd.md",
     "skills": [
@@ -759,7 +759,7 @@
   {
     "id": "T038",
     "priority": 1,
-    "status": "todo",
+    "status": "done",
     "title": "Sensitivity v1: virtual deletion（multiplier=0）+ キャッシュ + 条件間安定性",
     "path": "work/tasks/T038_sensitivity_virtual_deletion.md",
     "skills": [
@@ -777,7 +777,7 @@
   {
     "id": "T039",
     "priority": 1,
-    "status": "todo",
+    "status": "done",
     "title": "Viz DS dashboard v0: 条件分布/目的変数/感度ヒートマップ/収束プレースホルダ",
     "path": "work/tasks/T039_viz_ds_dashboard.md",
     "skills": [
@@ -799,7 +799,7 @@
   {
     "id": "T040",
     "priority": 1,
-    "status": "todo",
+    "status": "done",
     "title": "Viz Chem dashboard v0: species/ROP/ネットワークsubgraph/縮退差分プレースホルダ",
     "path": "work/tasks/T040_viz_chem_dashboard.md",
     "skills": [
@@ -820,7 +820,7 @@
   {
     "id": "T040G",
     "priority": 1,
-    "status": "todo",
+    "status": "done",
     "title": "Phase Gate P1→P2: Cantera/Graph/Feature/Sensitivity/Viz の統合テスト・修正/軽リファクタ",
     "path": "work/tasks/T040G_phase_gate_p1.md",
     "skills": [
@@ -874,7 +874,7 @@
   {
     "id": "T041",
     "priority": 2,
-    "status": "todo",
+    "status": "done",
     "title": "Optimization v0: random search（条件 or multipliers）+ history artifact",
     "path": "work/tasks/T041_opt_random_search.md",
     "skills": [
@@ -896,7 +896,7 @@
   {
     "id": "T042",
     "priority": 2,
-    "status": "todo",
+    "status": "done",
     "title": "Optimization v1: 多目的ベースライン（pareto archive / 簡易NSGA-II）",
     "path": "work/tasks/T042_opt_multiobjective_baseline.md",
     "skills": [
@@ -914,7 +914,7 @@
   {
     "id": "T043",
     "priority": 2,
-    "status": "todo",
+    "status": "done",
     "title": "Assimilation v0: パラメータ化（selected reactions）+ prior sampling + misfit/weights",
     "path": "work/tasks/T043_assim_param_misfit.md",
     "skills": [
@@ -935,7 +935,7 @@
   {
     "id": "T044",
     "priority": 2,
-    "status": "todo",
+    "status": "done",
     "title": "Assimilation v1: EKI baseline（pipeline rerun loop）+ PosteriorArtifact保存",
     "path": "work/tasks/T044_assim_eki_baseline.md",
     "skills": [
@@ -957,7 +957,7 @@
   {
     "id": "T045",
     "priority": 2,
-    "status": "todo",
+    "status": "done",
     "title": "Assimilation v2: ES-MDA baseline（任意/オプション依存）",
     "path": "work/tasks/T045_assim_esmda.md",
     "skills": [
@@ -975,7 +975,7 @@
   {
     "id": "T046",
     "priority": 2,
-    "status": "todo",
+    "status": "done",
     "title": "Reduction v0: mechanism patch schema（disable reaction / multiplier）+ apply",
     "path": "work/tasks/T046_reduction_patch_schema.md",
     "skills": [
@@ -996,7 +996,7 @@
   {
     "id": "T047",
     "priority": 2,
-    "status": "todo",
+    "status": "done",
     "title": "Reduction v1: threshold prune（importance/sensitivity 기반）で反応削除候補生成",
     "path": "work/tasks/T047_reduction_threshold_prune.md",
     "skills": [
@@ -1015,7 +1015,7 @@
   {
     "id": "T048",
     "priority": 2,
-    "status": "todo",
+    "status": "done",
     "title": "Reduction v2: validation loop（縮退→再実行→差分評価）とValidationArtifact",
     "path": "work/tasks/T048_reduction_validation_loop.md",
     "skills": [
@@ -1038,7 +1038,7 @@
   {
     "id": "T049",
     "priority": 2,
-    "status": "todo",
+    "status": "done",
     "title": "Reduction v3: node lumping prototype（元素/状態/電荷類似）+ mapping artifact",
     "path": "work/tasks/T049_reduction_node_lumping.md",
     "skills": [
@@ -1058,7 +1058,7 @@
   {
     "id": "T050",
     "priority": 2,
-    "status": "todo",
+    "status": "done",
     "title": "Reduction v4: reaction lumping prototype（reaction_type内クラスタ）",
     "path": "work/tasks/T050_reduction_reaction_lumping.md",
     "skills": [
@@ -1078,7 +1078,7 @@
   {
     "id": "T051",
     "priority": 2,
-    "status": "todo",
+    "status": "done",
     "title": "Golden suite: 代表条件セット + 回帰しきい値 + pytest回帰テスト",
     "path": "work/tasks/T051_golden_suite_regression.md",
     "skills": [
@@ -1098,7 +1098,7 @@
   {
     "id": "T052",
     "priority": 2,
-    "status": "todo",
+    "status": "done",
     "title": "Benchmark report: baseline vs advanced（最適化/同化/縮退）比較レポート生成",
     "path": "work/tasks/T052_benchmark_report.md",
     "skills": [
@@ -1121,7 +1121,7 @@
   {
     "id": "T052G",
     "priority": 2,
-    "status": "todo",
+    "status": "done",
     "title": "Phase Gate P2→P3: Optimization/Assimilation/Reduction/Golden/Benchmark の統合テスト・修正/軽リファクタ",
     "path": "work/tasks/T052G_phase_gate_p2.md",
     "skills": [
@@ -1163,7 +1163,7 @@
   {
     "id": "T053",
     "priority": 3,
-    "status": "todo",
+    "status": "done",
     "title": "Graph Laplacian: L/D/正規化ラプラシアン計算 + 保存（GraphArtifact拡張or別Artifact）",
     "path": "work/tasks/T053_graph_laplacian.md",
     "skills": [
@@ -1182,7 +1182,7 @@
   {
     "id": "T054",
     "priority": 3,
-    "status": "todo",
+    "status": "done",
     "title": "Assimilation: Laplacian regularizer（ペナルティ/疑似観測）をEKIに統合（オプション）",
     "path": "work/tasks/T054_assim_laplacian_regularized.md",
     "skills": [
@@ -1201,7 +1201,7 @@
   {
     "id": "T055",
     "priority": 3,
-    "status": "todo",
+    "status": "done",
     "title": "MBDoE/FIM skeleton: 感度から条件候補をランキング（D-opt等は将来）",
     "path": "work/tasks/T055_mbdoe_fim_ranking.md",
     "skills": [
@@ -1220,7 +1220,7 @@
   {
     "id": "T056",
     "priority": 3,
-    "status": "todo",
+    "status": "done",
     "title": "Active Subspace skeleton: 感度/サンプルから低次元方向を推定（簡易）",
     "path": "work/tasks/T056_active_subspace_skeleton.md",
     "skills": [
@@ -1238,7 +1238,7 @@
   {
     "id": "T057",
     "priority": 3,
-    "status": "todo",
+    "status": "done",
     "title": "SBI interface skeleton: sbiがあれば事後推定、無ければskip（summary=features）",
     "path": "work/tasks/T057_sbi_interface_skeleton.md",
     "skills": [
@@ -1257,7 +1257,7 @@
   {
     "id": "T058",
     "priority": 3,
-    "status": "todo",
+    "status": "done",
     "title": "GNN dataset export: 動的グラフ/イベント列をArtifactとして出力（自己教師前処理）",
     "path": "work/tasks/T058_gnn_dataset_export.md",
     "skills": [
@@ -1276,7 +1276,7 @@
   {
     "id": "T059",
     "priority": 3,
-    "status": "todo",
+    "status": "done",
     "title": "Multi-fidelity optimization skeleton: 縮退機構を低忠実度として探索に利用",
     "path": "work/tasks/T059_multi_fidelity_opt_skeleton.md",
     "skills": [
@@ -1296,7 +1296,7 @@
   {
     "id": "T060",
     "priority": 3,
-    "status": "todo",
+    "status": "done",
     "title": "CI/Docs polish: 最小CI・README・開発者向けクイックスタート整備",
     "path": "work/tasks/T060_ci_docs_polish.md",
     "skills": [
@@ -1317,7 +1317,7 @@
   {
     "id": "T060G",
     "priority": 3,
-    "status": "todo",
+    "status": "done",
     "title": "Phase Gate P3→Release: Advanced（Laplacian/MBDoE/AS/SBI/GNN/MF）を含む全体回帰・修正/整理",
     "path": "work/tasks/T060G_phase_gate_p3.md",
     "skills": [

@@ -1,0 +1,5 @@
+inputs:
+  run_id: "<run_id>"
+params:
+  observables: []
+  missing_strategy: nan

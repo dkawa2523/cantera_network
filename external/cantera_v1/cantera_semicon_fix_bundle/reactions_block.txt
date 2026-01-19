@@ -1,0 +1,12 @@
+REACTIONS    KCAL/MOLE  MOLES  CM  SEC
+CF2 + O = CFO + F                     1.000E+13   0.000   0.0
+CF3 + O = CF2 + FO                    5.000E+12   0.000   500.0
+CF4 + O = CF3 + FO                    2.000E+12   0.000   2000.0
+CF + O2 = CFO + O                     3.000E+13   0.000   800.0
+CF2 + O2 = CFO + FO                   2.500E+13   0.000   1200.0
+CFO + O = CO2 + F                     1.000E+13   0.000   0.0
+CFO + O2 = CO2 + FO                   2.000E+12   0.000   1000.0
+COF2 + O = CO2 + F                    8.000E+12   0.000   500.0
+CO + F + M = COF + M                  1.000E+18  -2.000   0.0
+COF + F = CO + F2                     1.000E+13   0.000   0.0
+END

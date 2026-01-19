@@ -1,0 +1,61 @@
+name: p1_smoke
+steps:
+  - id: sim
+    task: sim.run
+    sim: ${sim}
+
+  - id: observables
+    task: observables.run
+    inputs:
+      runs: "@sim"
+    params:
+      observables:
+        - gas_composition
+        - film_thickness
+        - coverage_summary
+
+  - id: graph
+    task: graphs.from_run
+    inputs:
+      run_id: "@sim"
+
+  - id: features
+    task: features.run
+    inputs:
+      runs: "@sim"
+    params:
+      features:
+        - name: timeseries_summary
+          params:
+            variables:
+              - T
+              - P
+        - name: rop_wdot_summary
+
+  - id: sensitivity
+    task: sensitivity.multiplier_fd
+    sim: ${sim}
+    params:
+      reactions:
+        - 0
+      observables:
+        - gas_composition
+        - film_thickness
+      eps: 0.05
+      missing_strategy: nan
+
+  - id: viz_ds
+    task: viz.ds_dashboard
+    name: ds_dashboard
+    inputs:
+      runs: "@sim"
+      observables: "@observables"
+      sensitivity: "@sensitivity"
+
+  - id: viz_chem
+    task: viz.chem_dashboard
+    name: chem_dashboard
+    inputs:
+      runs: "@sim"
+      features: "@features"
+      graphs: "@graph"

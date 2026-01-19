@@ -1,0 +1,17 @@
+! --------------------- GAS-PHASE KINETICS PREPROCESSOR INPUT ------------------
+ELEMENTS   C  F  O  N
+END
+
+SPECIES
+    CF4  CF3  CF2  CF   CFO  COF2  CO  CO2  O2  O   F   N2   ! 必要に応じて追加
+END
+
+THERMO ALL
+  200.000  1000.000  6000.000
+! ここに NASA 7 係数（各種ブロック）を貼り付けてください（therm.dat でも可）
+END
+
+REACTIONS    KCAL/MOLE  MOLES  CM  SEC
+! 以下のダミー行は ck2yaml の構文テスト用です。実解析では 100+ 反応で置換してください。
+CF2 + O = CFO + F                     1.00E+13   0.00    0.0
+END

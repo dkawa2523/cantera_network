@@ -18,3 +18,13 @@
 - 契約変更は原則禁止（docs/00...）
 - どうしても必要なら「互換性維持」「移行手順」「影響範囲」を必ず書く
 
+## 5. タスク追加・更新の手順
+- `work/queue.json` と `work/tasks/Txxx_*.md` をセットで更新する（Acceptance Criteria / Verification を必ず記載）。
+- 必要に応じて `work/STATUS.md` の件数と next を更新する。
+- 新しい契約ドキュメントを追加した場合は `docs/README.md` の読む順に追記する。
+- CI を追加する場合は `pytest -q` が短時間で通ることを前提にし、ネットワーク依存が避けられない場合は TODO として明記する。
+
+## 6. スパゲッティ防止のガードレール
+- カテゴリ間の接続は Artifact のみ（直接関数呼び出しをしない）。
+- 便利関数を増やす前に、Artifact 契約や Task API の見直しで吸収できないか検討する。
+- 新しい Artifact 種別や必須フィールドを追加した場合は、`docs/02_ARTIFACT_CONTRACTS.md` と validator/テストも更新する。
