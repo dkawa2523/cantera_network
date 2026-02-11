@@ -17,3 +17,4 @@ __pycache__/
 .venv_py310/
 .codex/
 .DS_Store
+runs/
