@@ -1,0 +1,48 @@
+steps:
+  - id: sim_full
+    task: sim.sweep_csv
+    inputs: {}
+    params:
+      mechanism_path: ${mechanism.path}
+      conditions_file: ${benchmarks.conditions_file}
+      model: gri30
+  - id: g
+    task: graphs.build
+    inputs: { runs: "@sim_full" }
+    params: {}
+  - id: f
+    task: features.extract
+    inputs: { runs: "@sim_full", graph: "@g" }
+    params:
+      feature_sets: [rop_summary]
+      rop_top_n: 100
+  - id: red
+    task: reduction.prune_by_importance
+    inputs: { graph: "@g", features: "@f" }
+    params:
+      method: rop_threshold
+      threshold: 1.0e-4
+  - id: sim_red
+    task: sim.sweep_csv
+    inputs: {}
+    params:
+      mechanism_path: ${mechanism.path}
+      conditions_file: ${benchmarks.conditions_file}
+      model: gri30
+      mechanism_patch: "@red"
+  - id: val
+    task: reduction.validate
+    inputs: { runs_base: "@sim_full", runs_reduced: "@sim_red" }
+    params:
+      metrics:
+        - name: CO2_final_rmse
+          target: "gas_composition:CO2_final"
+        - name: CO_final_rmse
+          target: "gas_composition:CO_final"
+      tolerances:
+        CO2_final_rmse: 0.03
+        CO_final_rmse: 0.03
+  - id: viz
+    task: viz.make
+    inputs: { validation: "@val", graph: "@g" }
+    params: { dashboard: ds }

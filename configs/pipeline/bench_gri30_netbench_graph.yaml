@@ -1,0 +1,30 @@
+# NetBench: graph build (single CSV case)
+steps:
+  - id: sim
+    task: sim.run_csv
+    sim: ${sim}
+    params:
+      conditions_file: ${benchmarks.conditions_file}
+      case_id: ${benchmarks.case_id}
+  - id: graph_mech
+    task: graphs.stoich
+    graphs:
+      mechanism: ${mechanism.path}
+    params: {}
+  - id: graph_flux
+    task: graphs.temporal_flux
+    inputs:
+      run_id: "@sim"
+      mechanism: ${mechanism.path}
+    params: {}
+  - id: viz
+    task: viz.chem_dashboard
+    name: bench_gri30_netbench_graph
+    dashboard: chem
+    chart_backend: svg
+    export_images:
+      enabled: true
+      formats: [svg]
+      dir: images
+    inputs: { runs: "@sim", graphs: ["@graph_mech", "@graph_flux"] }
+    params: {}

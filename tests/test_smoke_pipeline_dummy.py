@@ -13,9 +13,9 @@ def _config_dir() -> Path:
 
 
 def test_smoke_pipeline_dummy_creates_run_artifact(tmp_path: Path) -> None:
-    cfg = compose_config(config_path=_config_dir(), config_name="defaults")
+    cfg = compose_config(config_path=_config_dir(), config_name="default")
     resolved = resolve_config(cfg)
-    assert "pipeline" in resolved, "expected pipeline config in defaults"
+    assert "pipeline" in resolved, "expected pipeline config in default"
     assert isinstance(
         resolved.get("pipeline"), dict
     ), "expected pipeline config to be a mapping"
@@ -44,6 +44,9 @@ def test_smoke_pipeline_dummy_creates_run_artifact(tmp_path: Path) -> None:
     assert state_path.exists(), "expected run dataset at state.zarr/dataset.json"
 
     pipeline_cfg = dict(resolved["pipeline"])
+    common_cfg = resolved.get("common")
+    if isinstance(common_cfg, dict):
+        pipeline_cfg["common"] = dict(common_cfg)
     pipeline_run_id = make_run_id(pipeline_cfg, exclude_keys=("hydra",))
     assert store.exists("pipelines", pipeline_run_id), (
         f"expected pipeline manifest for {pipeline_run_id} to exist"

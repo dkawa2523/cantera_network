@@ -1,0 +1,14 @@
+# @package _global_
+defaults:
+  - override /sim: dummy
+  - override /pipeline: build_gnn_dataset
+  - _self_
+
+recipe:
+  name: build_gnn_dataset
+  description: Build a temporal graph PyG dataset from a dummy simulation.
+
+sim:
+  outputs:
+    include_rop: true
+    include_wdot: false

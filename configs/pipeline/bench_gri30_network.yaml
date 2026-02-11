@@ -1,0 +1,24 @@
+# Benchmark: single-run graph build + chem dashboard
+steps:
+  - id: sim
+    task: sim.run
+    sim: ${sim}
+    inputs: {}
+    params: {}
+  - id: graph_mech
+    task: graphs.stoich
+    graphs:
+      mechanism: ${sim.mechanism}
+    params: {}
+  - id: graph_flux
+    task: graphs.temporal_flux
+    inputs:
+      run_id: "@sim"
+      mechanism: ${sim.mechanism}
+    params: {}
+  - id: viz
+    task: viz.chem_dashboard
+    name: bench_gri30_network
+    dashboard: chem
+    inputs: { runs: "@sim", graphs: ["@graph_mech", "@graph_flux"] }
+    params: {}

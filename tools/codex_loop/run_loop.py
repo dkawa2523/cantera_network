@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import re
@@ -32,6 +33,7 @@ STATUS_MD = Path("work/STATUS.md")
 LOGS_DIR = Path("work/logs")
 WRAPPER_PATH = Path("tools/codex_loop/prompt_wrapper.md")
 SCHEMA_PATH = Path("tools/codex_loop/response_schema.json")
+LOCK_PATH = Path("work/.codex_loop.lock")
 
 
 @dataclass
@@ -39,6 +41,13 @@ class VerificationResult:
     commands: List[str]
     passed: bool
     output: str
+
+
+@dataclass
+class QueueData:
+    tasks: List[Dict[str, Any]]
+    raw: Optional[Dict[str, Any]]
+    format: str  # "list" or "object"
 
 
 def utc_now_iso() -> str:
@@ -78,16 +87,29 @@ def update_state_task(state: Dict[str, Any], task_id: str, **kwargs: Any) -> Non
     task_state.update(kwargs)
 
 
-def load_queue(repo_root: Path) -> List[Dict[str, Any]]:
+def load_queue(repo_root: Path) -> QueueData:
     path = repo_root / QUEUE_PATH
     data = load_json(path)
-    if not isinstance(data, list):
-        raise ValueError("queue.json must be a JSON list")
-    return data
+    if isinstance(data, list):
+        return QueueData(tasks=data, raw=None, format="list")
+    if isinstance(data, dict):
+        tasks = data.get("tasks")
+        if isinstance(tasks, list):
+            return QueueData(tasks=tasks, raw=data, format="object")
+    raise ValueError("queue.json must be a JSON list or an object with a 'tasks' list")
 
 
-def save_queue(repo_root: Path, queue: List[Dict[str, Any]]) -> None:
-    save_json(repo_root / QUEUE_PATH, queue)
+def save_queue(repo_root: Path, queue_data: QueueData) -> None:
+    path = repo_root / QUEUE_PATH
+    if queue_data.format == "list":
+        save_json(path, queue_data.tasks)
+        return
+    if queue_data.format == "object":
+        base: Dict[str, Any] = dict(queue_data.raw) if isinstance(queue_data.raw, dict) else {}
+        base["tasks"] = queue_data.tasks
+        save_json(path, base)
+        return
+    raise ValueError(f"Unknown queue format: {queue_data.format}")
 
 
 def tasks_by_id(queue: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
@@ -103,7 +125,48 @@ def deps_done(task: Dict[str, Any], by_id: Dict[str, Dict[str, Any]]) -> bool:
     return True
 
 
-def pick_next_task(queue: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+PRIORITY_RE = re.compile(r"^[Pp](\d+)$")
+
+
+def priority_value(raw: Any) -> int:
+    if raw is None:
+        return 999
+    if isinstance(raw, bool):
+        return 999
+    if isinstance(raw, (int, float)):
+        return int(raw)
+    if isinstance(raw, str):
+        s = raw.strip()
+        m = PRIORITY_RE.match(s)
+        if m:
+            return int(m.group(1))
+        try:
+            return int(s)
+        except ValueError:
+            return 999
+    return 999
+
+
+def format_priority(raw: Any) -> str:
+    if isinstance(raw, str):
+        s = raw.strip()
+        if PRIORITY_RE.match(s):
+            return s.upper()
+        return s
+    if raw is None:
+        return "P?"
+    if isinstance(raw, bool):
+        return "P?"
+    if isinstance(raw, (int, float)):
+        return f"P{int(raw)}"
+    return str(raw)
+
+
+def pick_next_task(
+    queue: List[Dict[str, Any]],
+    allowed_ids: Optional[set[str]] = None,
+    prefer_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     by_id = tasks_by_id(queue)
     candidates = [
         t
@@ -112,7 +175,15 @@ def pick_next_task(queue: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     ]
     if not candidates:
         return None
-    candidates.sort(key=lambda t: (int(t.get("priority", 999)), t.get("id", "")))
+    if allowed_ids is not None:
+        candidates = [t for t in candidates if t.get("id") in allowed_ids]
+        if not candidates:
+            return None
+    if prefer_id:
+        for t in candidates:
+            if t.get("id") == prefer_id:
+                return t
+    candidates.sort(key=lambda t: (priority_value(t.get("priority")), t.get("id", "")))
     return candidates[0]
 
 
@@ -219,6 +290,52 @@ def validate_output_schema(schema_path: Path) -> None:
     check(obj, '$')
 
 
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def acquire_lock(repo_root: Path) -> None:
+    lock_path = repo_root / LOCK_PATH
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    while True:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(f"{os.getpid()}\n")
+            break
+        except FileExistsError:
+            try:
+                raw = lock_path.read_text(encoding="utf-8").strip()
+                pid = int(raw) if raw else -1
+            except Exception:
+                pid = -1
+            if pid > 0 and _pid_alive(pid):
+                print(f"ERROR: another codex loop is running (pid={pid}).", file=sys.stderr)
+                raise SystemExit(2)
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _cleanup() -> None:
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            return
+        except Exception:
+            return
+
+    atexit.register(_cleanup)
+
+
 def _ensure_codex_auth(codex_home: Path, env: Dict[str, str]) -> None:
     auth_env_keys = (
         "OPENAI_API_KEY",
@@ -235,11 +352,21 @@ def _ensure_codex_auth(codex_home: Path, env: Dict[str, str]) -> None:
     home_auth = home_codex / "auth.json"
     home_config = home_codex / "config.toml"
 
+    def should_copy(src: Path, dst: Path) -> bool:
+        if not src.exists():
+            return False
+        if not dst.exists():
+            return True
+        try:
+            return src.stat().st_mtime > dst.stat().st_mtime
+        except OSError:
+            return True
+
     try:
-        if home_auth.exists() and not auth_path.exists():
+        if should_copy(home_auth, auth_path):
             shutil.copy2(home_auth, auth_path)
             os.chmod(auth_path, 0o600)
-        if home_config.exists() and not config_path.exists():
+        if should_copy(home_config, config_path):
             shutil.copy2(home_config, config_path)
             os.chmod(config_path, 0o600)
     except Exception:
@@ -334,7 +461,7 @@ def write_status_md(repo_root: Path, queue: List[Dict[str, Any]]) -> None:
     lines.append("## Queue\n\n")
     lines.append("| id | priority | status | title | depends_on |\n")
     lines.append("|---|---:|---|---|---|\n")
-    for t in sorted(queue, key=lambda x: (int(x.get("priority", 999)), x.get("id", ""))):
+    for t in sorted(queue, key=lambda x: (priority_value(x.get("priority")), x.get("id", ""))):
         deps = ",".join(t.get("depends_on", []) or [])
         lines.append(
             f"| {t.get('id')} | {t.get('priority')} | {t.get('status')} | {t.get('title')} | {deps} |\n"
@@ -349,6 +476,7 @@ def main() -> int:
     ap.add_argument("--codex-cmd", type=str, default="codex", help="codex CLI command name or path")
     ap.add_argument("--once", action="store_true", help="run only one runnable task")
     ap.add_argument("--task-id", type=str, default=None, help="run only the specified task id")
+    ap.add_argument("--start", type=str, default=None, help="start from task id (skip tasks before it in queue order)")
     ap.add_argument("--max-attempts", type=int, default=5, help="max retry attempts per task")
     ap.add_argument("--no-full-auto", action="store_true", help="do not pass --full-auto to codex")
     ap.add_argument("--yolo", action="store_true", help="pass --yolo (dangerous; use only in isolated env)")
@@ -357,6 +485,7 @@ def main() -> int:
     args = ap.parse_args()
 
     repo_root = Path(args.repo_root).resolve() if args.repo_root else find_repo_root(Path.cwd())
+    acquire_lock(repo_root)
     # Validate Codex output schema early to avoid opaque 400 errors from the API
     schema_file = repo_root / SCHEMA_PATH
     try:
@@ -366,13 +495,14 @@ def main() -> int:
         print("HINT: Ensure tools/codex_loop/response_schema.json includes verification.required=['commands','passed','notes']", file=sys.stderr)
         return 2
 
-    queue = load_queue(repo_root)
+    queue_data = load_queue(repo_root)
+    queue = queue_data.tasks
     state = load_state(repo_root)
 
     if args.list:
-        for t in sorted(queue, key=lambda x: (int(x.get("priority", 999)), x.get("id", ""))):
+        for t in sorted(queue, key=lambda x: (priority_value(x.get("priority")), x.get("id", ""))):
             deps = ",".join(t.get("depends_on", []) or [])
-            print(f"{t['id']}\t{t.get('status')}\tP{t.get('priority')}\tdeps=[{deps}]\t{t.get('title')}")
+            print(f"{t['id']}\t{t.get('status')}\t{format_priority(t.get('priority'))}\tdeps=[{deps}]\t{t.get('title')}")
         return 0
 
     LOGS_DIR_ABS = repo_root / LOGS_DIR
@@ -383,6 +513,43 @@ def main() -> int:
             if t.get("id") == tid:
                 return t
         return None
+
+    if args.task_id and args.start:
+        print("ERROR: --task-id and --start are mutually exclusive.", file=sys.stderr)
+        return 2
+
+    allowed_ids: Optional[set[str]] = None
+    if args.start:
+        start_index = None
+        start_task = None
+        for idx, t in enumerate(queue):
+            if t.get("id") == args.start:
+                start_index = idx
+                start_task = t
+                break
+        if start_index is None or start_task is None:
+            print(f"ERROR: start task not found in queue: {args.start}", file=sys.stderr)
+            return 2
+        # If the user asks to start from a task, ensure that task is runnable.
+        if start_task.get("status") != "todo":
+            prev_status = start_task.get("status")
+            start_task["status"] = "todo"
+            save_queue(repo_root, queue_data)
+            print(
+                f"NOTE: reset start task {args.start} status from {prev_status} to todo.",
+                file=sys.stderr,
+            )
+        task_state = state.setdefault("tasks", {}).setdefault(args.start, {"attempts": 0})
+        if int(task_state.get("attempts", 0)) != 0:
+            task_state["attempts"] = 0
+            task_state.pop("last_error", None)
+            task_state["last_status"] = "todo"
+            save_json(repo_root / STATE_PATH, state)
+            print(
+                f"NOTE: reset start task {args.start} attempts to 0.",
+                file=sys.stderr,
+            )
+        allowed_ids = {t.get("id") for t in queue[start_index:]}
 
     while True:
         task = None
@@ -399,7 +566,7 @@ def main() -> int:
                 print(f"Task {args.task_id} dependencies not satisfied.", file=sys.stderr)
                 return 2
         else:
-            task = pick_next_task(queue)
+            task = pick_next_task(queue, allowed_ids=allowed_ids, prefer_id=args.start)
             if not task:
                 print("No runnable todo tasks (all done, blocked, or waiting for deps).")
                 write_status_md(repo_root, queue)
@@ -411,7 +578,7 @@ def main() -> int:
         if not task_path.exists():
             print(f"Task file missing: {task_path}", file=sys.stderr)
             task["status"] = "blocked"
-            save_queue(repo_root, queue)
+            save_queue(repo_root, queue_data)
             write_status_md(repo_root, queue)
             return 2
 
@@ -423,14 +590,14 @@ def main() -> int:
         if task_state["attempts"] > int(args.max_attempts):
             task["status"] = "blocked"
             task_state["last_error"] = f"Exceeded max attempts ({args.max_attempts})"
-            save_queue(repo_root, queue)
+            save_queue(repo_root, queue_data)
             save_json(repo_root / STATE_PATH, state)
             write_status_md(repo_root, queue)
             return 2
 
         # mark doing
         task["status"] = "doing"
-        save_queue(repo_root, queue)
+        save_queue(repo_root, queue_data)
 
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         log_dir = LOGS_DIR_ABS / f"{task_id}_{ts}"
@@ -455,7 +622,7 @@ def main() -> int:
             # codex failed to run
             task["status"] = "blocked" if rc == 127 else "todo"
             task_state["last_error"] = f"codex exec failed: rc={rc}"
-            save_queue(repo_root, queue)
+            save_queue(repo_root, queue_data)
             save_json(repo_root / STATE_PATH, state)
             write_status_md(repo_root, queue)
             if args.task_id or args.once:
@@ -489,7 +656,7 @@ def main() -> int:
                 task_state["last_status"] = "todo"
                 task_state["last_error"] = "verification failed" if not verif.passed else "codex status not done"
 
-        save_queue(repo_root, queue)
+        save_queue(repo_root, queue_data)
         save_json(repo_root / STATE_PATH, state)
         write_status_md(repo_root, queue)
 

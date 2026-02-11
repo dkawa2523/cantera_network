@@ -1,0 +1,15 @@
+schema_version: 1
+description: "LearnCK stable species seed list (manual placeholder)."
+selection:
+  method: manual
+  source: configs/mechanism/dummy_minimal.yaml
+stable_species:
+  - name: A
+    phase: gas
+    elements:
+      X: 1
+  - name: B
+    phase: gas
+    elements:
+      X: 1
+notes: "TODO: Replace with domain-specific stable state selection."

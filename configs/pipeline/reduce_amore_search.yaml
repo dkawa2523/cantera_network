@@ -1,0 +1,54 @@
+name: reduce_amore_search
+steps:
+  - id: sim
+    task: sim.run
+    sim: ${sim}
+  - id: graph
+    task: graphs.temporal_flux
+    inputs:
+      run_id: "@sim"
+    params:
+      windowing:
+        type: log_time
+        count: 3
+        base: 10.0
+      aggregation:
+        mix:
+          mean: 0.5
+          p95: 0.5
+      sparsify:
+        quantile: 0.9
+  - id: amore
+    task: reduction.dispatch
+    inputs:
+      graph_id: "@graph"
+      mechanism: ${sim.mechanism}
+    method: amore_search
+    use_surrogate: ${use_surrogate}
+    params:
+      search:
+        beam_width: 3
+        max_depth: 2
+        expand_top: 4
+        cheap_score_min: 0.5
+        min_keep: 1
+      validation:
+        pipeline:
+          steps:
+            - id: sim
+              task: sim.run
+              sim: ${sim}
+            - id: obs
+              task: observables.run
+              inputs:
+                run_id: "@sim"
+              params:
+                observables:
+                  - name: gas_composition
+                    params:
+                      stats: [last]
+                      top_n: 2
+                missing_strategy: skip
+        metric: abs
+        tolerance: 1.0e-6
+        missing_strategy: skip

@@ -1,0 +1,16 @@
+# Optional ML stack (only if you implement GNN/SBI in your repo)
+# Keep this separate because it is heavy and platform/OS dependent.
+
+# PyTorch (choose the right build for your CUDA/CPU)
+torch
+torchvision
+
+# SBI (simulation-based inference)
+sbi
+
+# GNN frameworks (choose ONE; commented by default)
+# torch-geometric
+# dgl
+
+# Training utilities (optional)
+pytorch-lightning

@@ -14,5 +14,5 @@ species:
   - B
   - C
 outputs:
-  include_rop: false
-  include_wdot: false
+  include_rop: true
+  include_wdot: true

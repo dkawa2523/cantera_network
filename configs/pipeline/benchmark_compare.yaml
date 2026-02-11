@@ -1,0 +1,57 @@
+name: benchmark_compare
+steps:
+  - id: compare
+    task: reduction.benchmark_compare
+    sim: ${sim}
+    params:
+      benchmark:
+        name: default
+        note: shared benchmark for reducer comparison
+      split_seed: ${common.seed}
+      reducers:
+        - id: cnr
+          label: CNR-Coarse
+          pipeline: reduce_cnr_coarse
+          reduction_step: mapping
+          type: mapping
+        - id: gnn_pool
+          label: GNN-Pool
+          pipeline: reduce_gnn_pool_temporal
+          reduction_step: mapping
+          type: mapping
+        - id: amore
+          label: AMORE-Search
+          pipeline: reduce_amore_search
+          reduction_step: amore
+          type: reduction
+        - id: learnck
+          label: LearnCK-Style
+          pipeline: reduce_learnck_style
+          reduction_step: learnck
+          validation_step: validate
+          type: reduction
+        - id: gnn_prune
+          label: GNN-Importance-Prune
+          pipeline: reduce_gnn_importance_prune
+          reduction_step: prune
+          type: reduction
+      validation:
+        pipeline: p2_validation
+        metric: abs
+        tolerance: 1.0e-6
+        missing_strategy: skip
+        sim_step_id: sim
+        observables_step_id: observables
+        sim: ${sim}
+      mapping_eval:
+        gnn: gnn_pool
+        compare: cnr
+        report:
+          format: markdown
+          max_windows: 12
+      report:
+        title: Benchmark Comparison
+        filename: comparison.md
+        include_svg: true
+        svg_width: 640
+        svg_bar_height: 18

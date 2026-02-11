@@ -4,32 +4,39 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
 import copy
 import json
 import logging
 import math
-import platform
 from pathlib import Path
 import random
-import subprocess
 import tempfile
 from typing import Any, Optional
-
-from rxn_platform import __version__
 from rxn_platform.core import (
-    ArtifactManifest,
     load_config,
     make_artifact_id,
     make_run_id,
     normalize_reaction_multipliers,
 )
 from rxn_platform.errors import ConfigError
-from rxn_platform.hydra_utils import resolve_config
+from rxn_platform.io_utils import write_json_atomic
+from rxn_platform.mechanism import (
+    apply_patch_entries as _apply_patch_entries_shared,
+    reaction_id_index_map as _reaction_id_index_map_shared,
+    reaction_identifiers as _reaction_identifiers_shared,
+    resolve_patch_entries as _resolve_patch_entries_shared,
+    write_yaml_payload,
+)
 from rxn_platform.pipelines import PipelineRunner
 from rxn_platform.registry import Registry, register
 from rxn_platform.store import ArtifactCacheResult, ArtifactStore
 from rxn_platform.tasks.base import Task
+from rxn_platform.tasks.common import (
+    build_manifest,
+    code_metadata as _code_metadata,
+    read_table_rows as _read_table_rows,
+    resolve_cfg as _resolve_cfg,
+)
 
 try:  # Optional dependency.
     import pandas as pd
@@ -42,11 +49,6 @@ try:  # Optional dependency.
 except ImportError:  # pragma: no cover - optional dependency
     pa = None
     pq = None
-
-try:  # Optional dependency.
-    import yaml
-except ImportError:  # pragma: no cover - optional dependency
-    yaml = None
 
 DEFAULT_SAMPLES = 8
 DEFAULT_DIRECTION = "min"
@@ -106,21 +108,6 @@ class SampleResult:
     objective_values: list[float]
     objective_meta: list[dict[str, Any]]
     valid: bool
-
-
-def _utc_now_iso() -> str:
-    timestamp = datetime.now(timezone.utc).replace(microsecond=0)
-    return timestamp.isoformat().replace("+00:00", "Z")
-
-
-def _resolve_cfg(cfg: Any) -> dict[str, Any]:
-    try:
-        resolved = resolve_config(cfg)
-    except ConfigError:
-        if isinstance(cfg, Mapping):
-            return dict(cfg)
-        raise
-    return resolved
 
 
 def _extract_optimization_cfg(
@@ -667,93 +654,27 @@ def _extract_patch_multipliers(
 
 
 def _reaction_identifiers(reaction: Any, index: int) -> list[str]:
-    identifiers: list[str] = [f"R{index + 1}"]
-    if isinstance(reaction, Mapping):
-        for key in ("id", "name", "equation", "reaction"):
-            value = reaction.get(key)
-            if isinstance(value, str) and value.strip():
-                identifiers.append(value.strip())
-    elif isinstance(reaction, str) and reaction.strip():
-        identifiers.append(reaction.strip())
-    else:
-        raise ConfigError("reaction entries must be mappings or strings.")
-    seen: set[str] = set()
-    deduped: list[str] = []
-    for identifier in identifiers:
-        if identifier in seen:
-            continue
-        seen.add(identifier)
-        deduped.append(identifier)
-    return deduped
+    return _reaction_identifiers_shared(reaction, index)
 
 
 def _reaction_id_index_map(
     reactions: Sequence[Any],
 ) -> dict[str, list[int]]:
-    id_map: dict[str, list[int]] = {}
-    for idx, reaction in enumerate(reactions):
-        identifiers = _reaction_identifiers(reaction, idx)
-        for identifier in identifiers:
-            id_map.setdefault(identifier, []).append(idx)
-    return id_map
+    return _reaction_id_index_map_shared(reactions)
 
 
 def _resolve_patch_entries(
     entries: Sequence[Mapping[str, Any]],
     reactions: Sequence[Any],
 ) -> dict[int, dict[str, Any]]:
-    if not reactions:
-        raise ConfigError("mechanism has no reactions to patch.")
-    id_map = _reaction_id_index_map(reactions)
-    resolved: dict[int, dict[str, Any]] = {}
-    for entry in entries:
-        if "index" in entry:
-            idx = entry["index"]
-            if not isinstance(idx, int):
-                raise ConfigError("patch reaction index must be an int.")
-            if idx < 0 or idx >= len(reactions):
-                raise ConfigError(f"patch reaction index out of range: {idx}.")
-        else:
-            reaction_id = entry.get("reaction_id")
-            if not isinstance(reaction_id, str) or not reaction_id.strip():
-                raise ConfigError("patch reaction_id must be a non-empty string.")
-            indices = id_map.get(reaction_id)
-            if not indices:
-                raise ConfigError(f"reaction_id not found in mechanism: {reaction_id!r}.")
-            if len(indices) > 1:
-                raise ConfigError(
-                    f"reaction_id matches multiple reactions: {reaction_id!r}."
-                )
-            idx = indices[0]
-        resolved[idx] = dict(entry)
-    return resolved
+    return _resolve_patch_entries_shared(entries, reactions)
 
 
 def _apply_patch_entries(
     mechanism: Mapping[str, Any],
     entries: Sequence[Mapping[str, Any]],
 ) -> tuple[dict[str, Any], set[int]]:
-    reactions = mechanism.get("reactions")
-    if reactions is None:
-        raise ConfigError("mechanism must define a reactions list.")
-    if not isinstance(reactions, Sequence) or isinstance(
-        reactions,
-        (str, bytes, bytearray),
-    ):
-        raise ConfigError("mechanism.reactions must be a sequence.")
-    reaction_list = list(reactions)
-    resolved = _resolve_patch_entries(entries, reaction_list)
-    disabled_indices = {
-        idx for idx, entry in resolved.items() if float(entry.get("multiplier", 0.0)) == 0.0
-    }
-    filtered_reactions = [
-        reaction
-        for idx, reaction in enumerate(reaction_list)
-        if idx not in disabled_indices
-    ]
-    updated = dict(mechanism)
-    updated["reactions"] = filtered_reactions
-    return updated, disabled_indices
+    return _apply_patch_entries_shared(mechanism, entries)
 
 
 def _write_yaml_payload(
@@ -762,25 +683,7 @@ def _write_yaml_payload(
     *,
     sort_keys: bool,
 ) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        if yaml is None:
-            json.dump(
-                payload,
-                handle,
-                indent=2,
-                sort_keys=sort_keys,
-                ensure_ascii=True,
-            )
-            handle.write("\n")
-            return
-        yaml.safe_dump(
-            payload,
-            handle,
-            allow_unicode=False,
-            default_flow_style=False,
-            sort_keys=sort_keys,
-        )
+    write_yaml_payload(path, payload, sort_keys=sort_keys)
 
 
 def _prepare_reduced_mechanism(
@@ -907,23 +810,6 @@ def _run_sim_and_observables(
     }
     results = runner.run(pipeline_cfg)
     return results["sim"], results["obs"]
-
-
-def _read_table_rows(path: Path) -> list[dict[str, Any]]:
-    if pd is not None:
-        try:
-            frame = pd.read_parquet(path)
-            return frame.to_dict(orient="records")
-        except Exception:
-            pass
-    if pq is not None:
-        try:
-            table = pq.read_table(path)
-            return table.to_pylist()
-        except Exception:
-            pass
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    return list(payload.get("rows", []))
 
 
 def _aggregate_values(values: Sequence[float], method: str) -> float:
@@ -1132,42 +1018,12 @@ def _write_history_table(rows: Sequence[Mapping[str, Any]], path: Path) -> None:
         pq.write_table(table, path)
         return
     payload = {"columns": columns, "rows": list(rows)}
-    path.write_text(
-        json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    write_json_atomic(path, payload)
     logger = logging.getLogger("rxn_platform.optimization")
     logger.warning(
         "Parquet writer unavailable; stored JSON payload at %s.",
         path,
     )
-
-
-def _code_metadata() -> dict[str, Any]:
-    payload: dict[str, Any] = {"version": __version__}
-    git_dir = Path.cwd() / ".git"
-    if not git_dir.exists():
-        return payload
-    try:
-        commit = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
-        payload["git_commit"] = commit
-        dirty = subprocess.check_output(
-            ["git", "status", "--porcelain"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
-        payload["dirty"] = bool(dirty)
-    except (OSError, subprocess.SubprocessError):
-        return payload
-    return payload
-
-
-def _provenance_metadata() -> dict[str, Any]:
-    return {"python": platform.python_version()}
 
 
 def _dedupe_preserve(items: Sequence[str]) -> list[str]:
@@ -1373,16 +1229,12 @@ def run(
     )
 
     parents = _dedupe_preserve(run_ids + observable_ids)
-    manifest = ArtifactManifest(
-        schema_version=1,
+    manifest = build_manifest(
         kind="optimization",
-        id=artifact_id,
-        created_at=_utc_now_iso(),
+        artifact_id=artifact_id,
         parents=parents,
         inputs=inputs_payload,
         config=manifest_cfg,
-        code=_code_metadata(),
-        provenance=_provenance_metadata(),
     )
 
     def _writer(base_dir: Path) -> None:
@@ -1739,26 +1591,19 @@ def run_multi_fidelity(
     parents = _dedupe_preserve(run_ids + observable_ids)
     if reduction_id is not None:
         parents = _dedupe_preserve(parents + [reduction_id])
-    manifest = ArtifactManifest(
-        schema_version=1,
+    manifest = build_manifest(
         kind="optimization",
-        id=artifact_id,
-        created_at=_utc_now_iso(),
+        artifact_id=artifact_id,
         parents=parents,
         inputs=inputs_payload,
         config=manifest_cfg,
-        code=_code_metadata(),
-        provenance=_provenance_metadata(),
     )
 
     def _writer(base_dir: Path) -> None:
         _write_history_table(rows, base_dir / "history.parquet")
         _write_history_table(pareto_rows, base_dir / "pareto.parquet")
         summary_path = base_dir / "fidelity_summary.json"
-        summary_path.write_text(
-            json.dumps(fidelity_payload, ensure_ascii=True, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        write_json_atomic(summary_path, fidelity_payload)
 
     return store.ensure(manifest, writer=_writer)
 

@@ -4,27 +4,36 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from itertools import combinations
 import json
 import logging
 import math
-import platform
 from pathlib import Path
-import subprocess
 from typing import Any, Optional
-
-from rxn_platform import __version__
-from rxn_platform.core import ArtifactManifest, make_artifact_id
+from rxn_platform.core import make_artifact_id, normalize_reaction_multipliers, resolve_repo_path
 from rxn_platform.errors import ArtifactError, ConfigError
-from rxn_platform.hydra_utils import resolve_config
+from rxn_platform.io_utils import read_json, write_json_atomic
+from rxn_platform.mechanism import read_yaml_payload
 from rxn_platform.registry import Registry, register
+from rxn_platform.run_store import resolve_run_dataset_dir
 from rxn_platform.store import ArtifactCacheResult, ArtifactStore
+from rxn_platform.tasks.common import (
+    build_manifest,
+    code_metadata as _code_metadata,
+    load_run_dataset_payload,
+    load_run_ids_from_run_set,
+    resolve_cfg as _resolve_cfg,
+)
 
 try:  # Optional dependency.
     import pandas as pd
 except ImportError:  # pragma: no cover - optional dependency
     pd = None
+
+try:  # Optional dependency.
+    import numpy as np
+except ImportError:  # pragma: no cover - optional dependency
+    np = None
 
 try:  # Optional dependency.
     import pyarrow as pa
@@ -60,6 +69,9 @@ DEFAULT_NETWORK_METRICS = (
 DEFAULT_NETWORK_TOP_N = 25
 DEFAULT_NETWORK_STABILITY_TOP_N = 10
 REQUIRED_COLUMNS = ("run_id", "feature", "value", "unit", "meta_json")
+DEFAULT_STABLE_STATES_PATH = Path("reduction/learnck/stable_states.yaml")
+DEFAULT_STABLE_STATS = ("last",)
+DEFAULT_STABLE_SITE_TOL = 1.0e-6
 
 
 @dataclass(frozen=True)
@@ -276,21 +288,6 @@ class NetworkMetricFeature(FeatureExtractor):
             directed_override=cfg.get("directed"),
             betweenness_max_nodes=cfg.get("betweenness_max_nodes"),
         )
-
-
-def _utc_now_iso() -> str:
-    timestamp = datetime.now(timezone.utc).replace(microsecond=0)
-    return timestamp.isoformat().replace("+00:00", "Z")
-
-
-def _resolve_cfg(cfg: Any) -> dict[str, Any]:
-    try:
-        resolved = resolve_config(cfg)
-    except ConfigError:
-        if isinstance(cfg, Mapping):
-            return dict(cfg)
-        raise
-    return resolved
 
 
 def _extract_features_cfg(cfg: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -547,18 +544,36 @@ def _coerce_run_ids(value: Any) -> list[str]:
     raise ConfigError("run_id(s) must be a string or sequence of strings.")
 
 
-def _extract_run_ids(feat_cfg: Mapping[str, Any]) -> list[str]:
+def _extract_run_ids(
+    feat_cfg: Mapping[str, Any],
+    *,
+    store: Optional[ArtifactStore] = None,
+) -> list[str]:
     inputs = feat_cfg.get("inputs")
+    run_set_id: Any = None
     run_ids: Any = None
     if inputs is None:
         run_ids = None
     elif not isinstance(inputs, Mapping):
         raise ConfigError("features.inputs must be a mapping.")
     else:
+        if "run_set_id" in inputs:
+            run_set_id = inputs.get("run_set_id")
         for key in ("runs", "run_ids", "run_id", "run"):
             if key in inputs:
                 run_ids = inputs.get(key)
                 break
+        if run_set_id is not None and run_ids is not None:
+            raise ConfigError("Specify only one of run_set_id or run_id(s).")
+    if run_set_id is None and "run_set_id" in feat_cfg:
+        run_set_id = feat_cfg.get("run_set_id")
+        if run_set_id is not None and run_ids is not None:
+            raise ConfigError("Specify only one of run_set_id or run_id(s).")
+    if run_set_id is not None:
+        run_set_id = _require_nonempty_str(run_set_id, "run_set_id")
+        if store is None:
+            raise ConfigError("run_set_id requires a store to be provided.")
+        return load_run_ids_from_run_set(store, run_set_id)
     if run_ids is None:
         for key in ("runs", "run_ids", "run_id", "run"):
             if key in feat_cfg:
@@ -590,61 +605,148 @@ def _normalize_missing_strategy(value: Any) -> str:
     return strategy
 
 
-def _code_metadata() -> dict[str, Any]:
-    payload: dict[str, Any] = {"version": __version__}
-    git_dir = Path.cwd() / ".git"
-    if not git_dir.exists():
-        return payload
+def _coerce_optional_float(value: Any, label: str) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ConfigError(f"{label} must be a number.")
     try:
-        commit = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
-        payload["git_commit"] = commit
-        dirty = subprocess.check_output(
-            ["git", "status", "--porcelain"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
-        payload["dirty"] = bool(dirty)
-    except (OSError, subprocess.SubprocessError):
-        return payload
-    return payload
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{label} must be a number.") from exc
 
 
-def _provenance_metadata() -> dict[str, Any]:
-    return {"python": platform.python_version()}
-
-
-def _load_run_dataset_payload(run_dir: Path) -> dict[str, Any]:
-    dataset_path = run_dir / "state.zarr" / "dataset.json"
-    if dataset_path.exists():
-        try:
-            payload = json.loads(dataset_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise ArtifactError(f"Run dataset JSON is invalid: {exc}") from exc
+def _load_stable_states_payload(
+    value: Any,
+) -> tuple[dict[str, Any], Optional[str]]:
+    if value is None:
+        path = resolve_repo_path(DEFAULT_STABLE_STATES_PATH)
+        payload = read_yaml_payload(path)
         if not isinstance(payload, Mapping):
-            raise ArtifactError("Run dataset JSON must be a mapping.")
-        return dict(payload)
-    if xr is None:
-        raise ArtifactError(
-            "Run dataset not found; install xarray to load state.zarr."
-        )
-    dataset = xr.open_zarr(run_dir / "state.zarr")
-    coords = {
-        name: {"dims": [name], "data": dataset.coords[name].values.tolist()}
-        for name in dataset.coords
-    }
-    data_vars = {
-        name: {"dims": list(dataset[name].dims), "data": dataset[name].values.tolist()}
-        for name in dataset.data_vars
-    }
-    return {"coords": coords, "data_vars": data_vars, "attrs": dict(dataset.attrs)}
+            raise ConfigError("stable_states config must be a mapping.")
+        return dict(payload), str(path)
+    if isinstance(value, Mapping):
+        return dict(value), None
+    if isinstance(value, Path):
+        value = str(value)
+    if isinstance(value, str):
+        path = resolve_repo_path(value)
+        if not path.exists():
+            raise ConfigError(f"stable_states file not found: {value}")
+        payload = read_yaml_payload(path)
+        if not isinstance(payload, Mapping):
+            raise ConfigError("stable_states file must contain a mapping.")
+        return dict(payload), str(path)
+    raise ConfigError("stable_states must be a mapping or path to YAML/JSON.")
+
+
+def _normalize_phase(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ConfigError("stable_states.phase must be a string when provided.")
+    text = value.strip().lower()
+    if not text:
+        return None
+    if "surf" in text or "surface" in text:
+        return "surface"
+    if "gas" in text:
+        return "gas"
+    return text
+
+
+def _normalize_stable_entries(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    entries_raw: Any = None
+    for key in ("stable_species", "stable_states", "states", "species"):
+        if key in payload:
+            entries_raw = payload.get(key)
+            break
+    if entries_raw is None:
+        raise ConfigError("stable_states must define stable_species.")
+    if isinstance(entries_raw, str):
+        entries_raw = [entries_raw]
+    if not isinstance(entries_raw, Sequence) or isinstance(
+        entries_raw,
+        (bytes, bytearray),
+    ):
+        raise ConfigError("stable_species must be a list of entries.")
+    entries: list[dict[str, Any]] = []
+    for index, entry in enumerate(entries_raw):
+        if isinstance(entry, str):
+            name = _require_nonempty_str(entry, f"stable_species[{index}]")
+            entries.append({"name": name, "phase": None})
+            continue
+        if isinstance(entry, Mapping):
+            name = entry.get("name") or entry.get("species") or entry.get("id")
+            name = _require_nonempty_str(name, f"stable_species[{index}].name")
+            phase = _normalize_phase(entry.get("phase") or entry.get("kind"))
+            entries.append({"name": name, "phase": phase})
+            continue
+        raise ConfigError("stable_species entries must be strings or mappings.")
+    return entries
+
+
+def _stable_site_total(
+    payload: Mapping[str, Any],
+    params: Mapping[str, Any],
+) -> Optional[float]:
+    for key in ("site_total", "sites_total", "total_sites", "coverage_total"):
+        if key in params:
+            return _coerce_optional_float(params.get(key), key)
+    for key in ("site_total", "sites_total", "total_sites"):
+        if key in payload:
+            return _coerce_optional_float(payload.get(key), key)
+    return None
+
+
+def _extract_series(
+    dataset: Any,
+    *,
+    var_name: str,
+    coord_name: str,
+    species_name: str,
+) -> Optional[Any]:
+    if var_name not in dataset.data_vars:
+        raise ConfigError(f"Run dataset missing variable: {var_name}")
+    data = dataset[var_name]
+    if coord_name not in data.dims:
+        raise ConfigError(f"{var_name} is missing coord {coord_name}.")
+    try:
+        series = data.sel({coord_name: species_name})
+    except KeyError:
+        return None
+    if "time" not in series.dims:
+        raise ConfigError(f"{var_name} must include time dimension.")
+    return series.transpose("time").values
+
+
+def _compute_stat(
+    series: Any,
+    time_values: Optional[Any],
+    stat: str,
+) -> float:
+    if np is None:
+        raise ConfigError("numpy is required to compute stable projection stats.")
+    values = np.asarray(series, dtype=float)
+    if values.size == 0:
+        return math.nan
+    if stat == "last":
+        return float(values[-1])
+    if stat == "mean":
+        return float(np.nanmean(values))
+    if stat == "max":
+        return float(np.nanmax(values))
+    if stat == "min":
+        return float(np.nanmin(values))
+    if stat == "integral":
+        if time_values is None:
+            raise ConfigError("integral stat requires time coordinates.")
+        return float(np.trapz(values, x=np.asarray(time_values, dtype=float)))
+    raise ConfigError(f"Unsupported stat: {stat}")
 
 
 def _load_run_dataset_view(run_dir: Path) -> RunDatasetView:
-    payload = _load_run_dataset_payload(run_dir)
+    payload = load_run_dataset_payload(run_dir)
     coords = payload.get("coords", {})
     data_vars = payload.get("data_vars", {})
     attrs = payload.get("attrs", {})
@@ -660,6 +762,350 @@ def _load_run_dataset_view(run_dir: Path) -> RunDatasetView:
         attrs=dict(attrs),
         raw=dict(payload),
     )
+
+
+def _load_gnn_dataset_payload(
+    store: ArtifactStore,
+    dataset_id: str,
+) -> tuple[dict[str, Any], Path]:
+    store.read_manifest("gnn_datasets", dataset_id)
+    dataset_dir = store.artifact_dir("gnn_datasets", dataset_id)
+    payload_path = dataset_dir / "dataset.json"
+    if not payload_path.exists():
+        raise ConfigError(f"gnn dataset metadata not found: {payload_path}")
+    try:
+        payload = read_json(payload_path)
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"gnn dataset dataset.json is not valid JSON: {exc}") from exc
+    if not isinstance(payload, Mapping):
+        raise ConfigError("gnn dataset dataset.json must be a JSON object.")
+    return dict(payload), dataset_dir
+
+
+def _load_gnn_dataset_items(
+    payload: Mapping[str, Any],
+    *,
+    dataset_dir: Path,
+) -> list[dict[str, Any]]:
+    files = payload.get("files")
+    if not isinstance(files, Mapping):
+        files = {}
+    dataset_root = payload.get("dataset_root")
+    if isinstance(dataset_root, str) and dataset_root:
+        data_root = Path(dataset_root)
+    else:
+        data_root = dataset_dir
+    data_json = files.get("data_json") or "data.json"
+    data_pt = files.get("data_pt") or "data.pt"
+
+    data_path = data_root / str(data_json)
+    if data_path.exists():
+        try:
+            data_payload = read_json(data_path)
+        except json.JSONDecodeError as exc:
+            raise ConfigError(f"gnn dataset data.json is not valid JSON: {exc}") from exc
+        if not isinstance(data_payload, Mapping):
+            raise ConfigError("gnn dataset data.json must be a JSON object.")
+        items = data_payload.get("items")
+        if not isinstance(items, Sequence) or isinstance(
+            items, (str, bytes, bytearray)
+        ):
+            raise ConfigError("gnn dataset items must be a list.")
+        return [dict(item) for item in items if isinstance(item, Mapping)]
+
+    data_path = data_root / str(data_pt)
+    if data_path.exists():
+        try:
+            import torch  # noqa: F401
+        except ImportError as exc:
+            raise ConfigError(
+                "torch is required to load pyg datasets; "
+                "rerun gnn_dataset with json output or install rxn-platform[gnn]."
+            ) from exc
+        try:
+            data_payload = torch.load(data_path, weights_only=False)
+        except TypeError:
+            data_payload = torch.load(data_path)
+        if not isinstance(data_payload, Mapping):
+            raise ConfigError("gnn dataset data.pt must contain a mapping.")
+        raw_items = data_payload.get("data_list")
+        if not isinstance(raw_items, Sequence):
+            raise ConfigError("gnn dataset data.pt missing data_list.")
+        items: list[dict[str, Any]] = []
+        for data in raw_items:
+            window_id = getattr(data, "window_id", None)
+            features = getattr(data, "x", None)
+            edge_index = getattr(data, "edge_index", None)
+            edge_attr = getattr(data, "edge_attr", None)
+            if window_id is None or features is None:
+                continue
+            try:
+                features_np = features.detach().cpu().numpy().tolist()
+                edge_index_np = (
+                    edge_index.detach().cpu().numpy().tolist()
+                    if edge_index is not None
+                    else [[], []]
+                )
+                edge_attr_np = (
+                    edge_attr.detach().cpu().numpy().tolist()
+                    if edge_attr is not None
+                    else []
+                )
+            except Exception as exc:  # pragma: no cover - optional dependency
+                raise ConfigError("gnn dataset features could not be converted.") from exc
+            if isinstance(edge_attr_np, Sequence) and edge_attr_np:
+                if isinstance(edge_attr_np[0], Sequence):
+                    edge_attr_np = [row[0] for row in edge_attr_np]
+            items.append(
+                {
+                    "window_id": int(window_id),
+                    "x": features_np,
+                    "edge_index": edge_index_np,
+                    "edge_attr": edge_attr_np,
+                    "window": {
+                        "start_time": getattr(data, "window_start", None),
+                        "end_time": getattr(data, "window_end", None),
+                        "start_idx": getattr(data, "window_index", None),
+                    },
+                    "run_id": getattr(data, "run_id", None),
+                    "case_id": getattr(data, "case_id", None),
+                }
+            )
+        return items
+
+    raise ConfigError(
+        "gnn dataset data.json not found; rerun gnn_dataset with json output."
+    )
+
+
+def _load_run_dataset_xr(run_dir: Path) -> Any:
+    if xr is None:
+        raise ArtifactError("xarray is required to load timeseries.zarr.")
+    dataset_dir = resolve_run_dataset_dir(run_dir)
+    if dataset_dir is None:
+        raise ArtifactError(
+            "Run dataset not found; expected sim/timeseries.zarr or state.zarr."
+        )
+    json_path = dataset_dir / "dataset.json"
+    if json_path.exists():
+        try:
+            payload = read_json(json_path)
+        except json.JSONDecodeError as exc:
+            raise ArtifactError(f"Run dataset JSON is invalid: {exc}") from exc
+        if not isinstance(payload, Mapping):
+            raise ArtifactError("Run dataset JSON must be a mapping.")
+        coords_payload = payload.get("coords", {})
+        vars_payload = payload.get("data_vars", {})
+        attrs_payload = payload.get("attrs", {})
+        if not isinstance(coords_payload, Mapping) or not isinstance(
+            vars_payload, Mapping
+        ):
+            raise ArtifactError("Run dataset JSON is missing coords/data_vars.")
+        coords: dict[str, Any] = {}
+        for name, entry in coords_payload.items():
+            if not isinstance(entry, Mapping):
+                continue
+            dims = entry.get("dims") or [name]
+            data = entry.get("data")
+            coords[name] = (list(dims), data)
+        data_vars: dict[str, Any] = {}
+        for name, entry in vars_payload.items():
+            if not isinstance(entry, Mapping):
+                continue
+            dims = entry.get("dims")
+            data = entry.get("data")
+            if dims is None:
+                continue
+            data_vars[name] = (list(dims), data)
+        dataset = xr.Dataset(data_vars=data_vars, coords=coords, attrs=attrs_payload)
+        return dataset
+    return xr.open_zarr(dataset_dir)
+
+
+def _extract_mapping_id(feat_cfg: Mapping[str, Any]) -> str:
+    inputs = feat_cfg.get("inputs")
+    if inputs is None:
+        inputs = {}
+    if not isinstance(inputs, Mapping):
+        raise ConfigError("features.inputs must be a mapping.")
+    for key in ("mapping_id", "reduction_id", "mapping"):
+        if key in inputs:
+            return _require_nonempty_str(inputs.get(key), "mapping_id")
+    for key in ("mapping_id", "reduction_id", "mapping"):
+        if key in feat_cfg:
+            return _require_nonempty_str(feat_cfg.get(key), "mapping_id")
+    raise ConfigError("mapping_id is required for superstate timeseries.")
+
+
+def _load_mapping_payload(store: ArtifactStore, mapping_id: str) -> dict[str, Any]:
+    store.read_manifest("reduction", mapping_id)
+    mapping_path = store.artifact_dir("reduction", mapping_id) / "mapping.json"
+    if not mapping_path.exists():
+        raise ConfigError(f"mapping.json not found for reduction/{mapping_id}")
+    try:
+        payload = read_json(mapping_path)
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"mapping.json is not valid JSON: {exc}") from exc
+    if not isinstance(payload, Mapping):
+        raise ConfigError("mapping.json must contain a JSON object.")
+    return dict(payload)
+
+
+def _load_superstate_payload(store: ArtifactStore, mapping_id: str) -> dict[str, Any]:
+    """Load a superstate mapping payload from a reduction artifact.
+
+    Supported files:
+    - mapping.json (CNR/GNN mapping output)
+    - node_lumping.json (stoichiometric node lumping output)
+    """
+    store.read_manifest("reduction", mapping_id)
+    base_dir = store.artifact_dir("reduction", mapping_id)
+    mapping_path = base_dir / "mapping.json"
+    node_lumping_path = base_dir / "node_lumping.json"
+    payload_path = None
+    if mapping_path.exists():
+        payload_path = mapping_path
+    elif node_lumping_path.exists():
+        payload_path = node_lumping_path
+    else:
+        raise ConfigError(
+            f"Expected mapping.json or node_lumping.json for reduction/{mapping_id}."
+        )
+    try:
+        payload = read_json(payload_path)
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"{payload_path.name} is not valid JSON: {exc}") from exc
+    if not isinstance(payload, Mapping):
+        raise ConfigError(f"{payload_path.name} must contain a JSON object.")
+    return dict(payload)
+
+
+def _resolve_superstate_mapping_any(
+    payload: Mapping[str, Any],
+) -> tuple[list[str], dict[str, int], dict[int, list[str]]]:
+    """Resolve superstate mapping from either mapping.json or node_lumping.json."""
+    mapping = payload.get("mapping")
+    if not isinstance(mapping, Sequence) or isinstance(mapping, (str, bytes, bytearray)):
+        raise ConfigError("superstate mapping payload must include a mapping list.")
+    first = None
+    for entry in mapping:
+        if isinstance(entry, Mapping):
+            first = entry
+            break
+    if first is None:
+        raise ConfigError("superstate mapping payload has no mapping entries.")
+    if "superstate_id" in first:
+        return _resolve_superstate_mapping(payload)
+    if "cluster_id" in first:
+        clusters = payload.get("clusters")
+        if not isinstance(clusters, Sequence) or isinstance(
+            clusters, (str, bytes, bytearray)
+        ):
+            raise ConfigError("node_lumping clusters must be a list.")
+        name_by_id: dict[int, str] = {}
+        members_by_id: dict[int, list[str]] = {}
+        for entry in clusters:
+            if not isinstance(entry, Mapping):
+                continue
+            cid = entry.get("cluster_id")
+            rep = entry.get("representative")
+            if not isinstance(cid, int):
+                continue
+            if isinstance(rep, str) and rep.strip():
+                name_by_id[int(cid)] = rep.strip()
+            members = entry.get("members") or []
+            if isinstance(members, Sequence) and not isinstance(
+                members, (str, bytes, bytearray)
+            ):
+                members_by_id[int(cid)] = [str(item) for item in members]
+            else:
+                members_by_id[int(cid)] = []
+        mapping_by_name: dict[str, int] = {}
+        for entry in mapping:
+            if not isinstance(entry, Mapping):
+                continue
+            species = entry.get("species")
+            cid = entry.get("cluster_id")
+            if isinstance(species, str) and isinstance(cid, int):
+                mapping_by_name[species] = int(cid)
+        if not mapping_by_name:
+            raise ConfigError("node_lumping has no species mapping.")
+        max_id = max(mapping_by_name.values())
+        superstate_names: list[str] = []
+        for idx in range(max_id + 1):
+            name = name_by_id.get(idx) or f"S{idx:03d}"
+            superstate_names.append(name)
+        return superstate_names, mapping_by_name, members_by_id
+    raise ConfigError("Unsupported mapping entries: expected superstate_id or cluster_id.")
+
+
+def _resolve_superstate_mapping(
+    payload: Mapping[str, Any],
+) -> tuple[list[str], dict[str, int], dict[int, list[str]]]:
+    clusters = payload.get("clusters")
+    mapping = payload.get("mapping")
+    if not isinstance(mapping, Sequence) or isinstance(
+        mapping, (str, bytes, bytearray)
+    ):
+        raise ConfigError("mapping.json mapping entries must be a list.")
+    # "clusters" is optional for some mapping producers (e.g., node_lumping emits only
+    # the per-species mapping). When missing, we synthesize members_by_id from mapping.
+    if clusters is None:
+        clusters_seq: Sequence[Any] = []
+    elif not isinstance(clusters, Sequence) or isinstance(
+        clusters, (str, bytes, bytearray)
+    ):
+        raise ConfigError("mapping.json clusters must be a list when provided.")
+    else:
+        clusters_seq = clusters
+    name_by_id: dict[int, str] = {}
+    members_by_id: dict[int, list[str]] = {}
+    for entry in clusters_seq:
+        if not isinstance(entry, Mapping):
+            continue
+        sid = entry.get("superstate_id")
+        name = entry.get("name")
+        if isinstance(sid, int) and isinstance(name, str) and name.strip():
+            name_by_id[int(sid)] = name
+            members = entry.get("members")
+            if isinstance(members, Sequence) and not isinstance(
+                members, (str, bytes, bytearray)
+            ):
+                members_by_id[int(sid)] = [str(item) for item in members]
+            else:
+                members_by_id[int(sid)] = []
+    mapping_by_name: dict[str, int] = {}
+    for entry in mapping:
+        if not isinstance(entry, Mapping):
+            continue
+        species = entry.get("species")
+        super_id = entry.get("superstate_id")
+        if isinstance(species, str) and isinstance(super_id, int):
+            mapping_by_name[species] = int(super_id)
+    if not mapping_by_name:
+        raise ConfigError("mapping.json has no species mapping.")
+    # Fill members_by_id using mapping entries, but de-duplicate any overlap with the
+    # optional clusters[*].members lists (some producers emit both).
+    for species, sid in mapping_by_name.items():
+        members_by_id.setdefault(int(sid), []).append(species)
+    for sid, members in list(members_by_id.items()):
+        seen: set[str] = set()
+        unique: list[str] = []
+        for item in members:
+            name = str(item)
+            if name in seen:
+                continue
+            seen.add(name)
+            unique.append(name)
+        members_by_id[int(sid)] = unique
+    max_id = max(mapping_by_name.values())
+    superstate_names: list[str] = []
+    for idx in range(max_id + 1):
+        name = name_by_id.get(idx)
+        if not name:
+            name = f"S{idx:03d}"
+        superstate_names.append(name)
+    return superstate_names, mapping_by_name, members_by_id
 
 
 def _feature_requirements(feature: Any) -> tuple[list[str], list[str], list[str]]:
@@ -931,11 +1377,10 @@ def _write_features_table(rows: Sequence[Mapping[str, Any]], path: Path) -> None
         pq.write_table(table, path)
         return
     payload = {"columns": list(REQUIRED_COLUMNS), "rows": list(rows)}
-    payload_text = json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n"
-    path.write_text(payload_text, encoding="utf-8")
+    write_json_atomic(path, payload)
     json_path = path.with_suffix(".json")
     if json_path != path:
-        json_path.write_text(payload_text, encoding="utf-8")
+        write_json_atomic(json_path, payload)
     logger = logging.getLogger("rxn_platform.features")
     logger.warning(
         "Parquet writer unavailable; stored JSON payload at %s and %s.",
@@ -1551,6 +1996,9 @@ def _summarize_ranked_variable(
         spec.rank_by,
         rank_abs=spec.rank_abs,
     )
+    index_map: dict[str, int] = {}
+    if spec.axis == "reaction":
+        index_map = {name: idx for idx, name in enumerate(axis_names)}
     rows: list[dict[str, Any]] = []
     for name in selected:
         stats = stats_by_id.get(name, {})
@@ -1566,6 +2014,8 @@ def _summarize_ranked_variable(
                 "rank_by": spec.rank_by,
                 "rank_abs": spec.rank_abs,
             }
+            if spec.axis == "reaction" and name in index_map:
+                meta["reaction_index"] = index_map[name]
             if time_values is None and stat == "integral":
                 meta["status"] = "missing_time"
                 if time_error:
@@ -1684,7 +2134,7 @@ def _load_graph_payload(path: Path) -> dict[str, Any]:
     if not graph_path.exists():
         raise ArtifactError(f"graph.json not found in {path}.")
     try:
-        payload = json.loads(graph_path.read_text(encoding="utf-8"))
+        payload = read_json(graph_path)
     except json.JSONDecodeError as exc:
         raise ArtifactError(f"graph.json is not valid JSON: {exc}") from exc
     if not isinstance(payload, Mapping):
@@ -2003,6 +2453,7 @@ def _network_metric_rows(
             )
             continue
         for node_id in selected:
+            node_meta = node_map.get(node_id, {})
             meta = {
                 "status": status,
                 "feature_kind": "network_metrics",
@@ -2015,6 +2466,15 @@ def _network_metric_rows(
                 "top_n": top_n,
                 "source": "graph",
             }
+            reaction_id = node_meta.get("reaction_id")
+            if isinstance(reaction_id, str) and reaction_id.strip():
+                meta["reaction_id"] = reaction_id.strip()
+            reaction_index = node_meta.get("reaction_index")
+            if reaction_index is not None and not isinstance(reaction_index, bool):
+                try:
+                    meta["reaction_index"] = int(reaction_index)
+                except (TypeError, ValueError):
+                    pass
             rows.append(
                 {
                     "feature": f"network.{metric}.{node_id}",
@@ -2235,28 +2695,71 @@ def _compute_network_metric_values(
             )
 
     if "betweenness_centrality" in metric_values:
-        if nx is None:
-            metric_status["betweenness_centrality"] = "missing_dependency"
+        max_nodes = _coerce_optional_int(
+            betweenness_max_nodes,
+            "betweenness_max_nodes",
+        )
+        if max_nodes is not None and node_count > max_nodes:
+            metric_status["betweenness_centrality"] = "node_limit"
             for node_id in nodes:
                 metric_values["betweenness_centrality"][node_id] = math.nan
+        elif nx is not None:
+            graph = nx.DiGraph() if directed else nx.Graph()
+            graph.add_nodes_from(nodes)
+            graph.add_edges_from(edges)
+            scores = nx.betweenness_centrality(graph)
+            metric_status["betweenness_centrality"] = "ok"
+            for node_id in nodes:
+                metric_values["betweenness_centrality"][node_id] = float(
+                    scores.get(node_id, 0.0)
+                )
         else:
-            max_nodes = _coerce_optional_int(
-                betweenness_max_nodes,
-                "betweenness_max_nodes",
-            )
-            if max_nodes is not None and node_count > max_nodes:
-                metric_status["betweenness_centrality"] = "node_limit"
-                for node_id in nodes:
-                    metric_values["betweenness_centrality"][node_id] = math.nan
-            else:
-                graph = nx.DiGraph() if directed else nx.Graph()
-                graph.add_nodes_from(nodes)
-                graph.add_edges_from(edges)
-                scores = nx.betweenness_centrality(graph)
-                for node_id in nodes:
-                    metric_values["betweenness_centrality"][node_id] = float(
-                        scores.get(node_id, 0.0)
-                    )
+            # Optional dependency fallback: Brandes betweenness centrality for
+            # unweighted graphs (sufficient for ranking/pruning).
+            from collections import deque
+
+            index = {node_id: idx for idx, node_id in enumerate(nodes)}
+            neighbors: list[list[int]] = []
+            for node_id in nodes:
+                nbrs = []
+                for target in adjacency.get(node_id, set()):
+                    idx = index.get(target)
+                    if idx is not None:
+                        nbrs.append(idx)
+                neighbors.append(nbrs)
+
+            n = len(nodes)
+            betweenness = [0.0] * n
+            for s in range(n):
+                stack: list[int] = []
+                preds: list[list[int]] = [[] for _ in range(n)]
+                sigma = [0.0] * n
+                dist = [-1] * n
+                sigma[s] = 1.0
+                dist[s] = 0
+                queue: deque[int] = deque([s])
+                while queue:
+                    v = queue.popleft()
+                    stack.append(v)
+                    for w in neighbors[v]:
+                        if dist[w] < 0:
+                            dist[w] = dist[v] + 1
+                            queue.append(w)
+                        if dist[w] == dist[v] + 1:
+                            sigma[w] += sigma[v]
+                            preds[w].append(v)
+                delta = [0.0] * n
+                while stack:
+                    w = stack.pop()
+                    for v in preds[w]:
+                        if sigma[w]:
+                            delta[v] += (sigma[v] / sigma[w]) * (1.0 + delta[w])
+                    if w != s:
+                        betweenness[w] += delta[w]
+
+            metric_status["betweenness_centrality"] = "ok"
+            for node_id, score in zip(nodes, betweenness):
+                metric_values["betweenness_centrality"][node_id] = float(score)
     return metric_values, metric_status
 
 
@@ -2440,6 +2943,1948 @@ def _apply_network_stability(rows: list[dict[str, Any]], run_ids: Sequence[str])
             )
 
 
+def stable_projection_timeseries(
+    cfg: Mapping[str, Any],
+    *,
+    store: ArtifactStore,
+    registry: Optional[Registry] = None,
+) -> ArtifactCacheResult:
+    """Project run time series onto a stable-species subset."""
+    if not isinstance(cfg, Mapping):
+        raise ConfigError("cfg must be a mapping.")
+    if xr is None:
+        raise ConfigError("xarray is required for stable projection.")
+    if np is None:
+        raise ConfigError("numpy is required for stable projection.")
+
+    resolved_cfg = _resolve_cfg(cfg)
+    manifest_cfg, feat_cfg = _extract_features_cfg(resolved_cfg)
+    params = _extract_params(feat_cfg)
+    run_ids = _extract_run_ids(feat_cfg, store=store)
+
+    stable_value = (
+        params.get("stable_states")
+        or feat_cfg.get("stable_states")
+        or feat_cfg.get("stable")
+    )
+    stable_payload, stable_path = _load_stable_states_payload(stable_value)
+    stable_entries = _normalize_stable_entries(stable_payload)
+    if not stable_entries:
+        raise ConfigError("stable_states produced no stable species entries.")
+
+    stats = (
+        _normalize_stats(params.get("stats"))
+        if params.get("stats") is not None
+        else list(DEFAULT_STABLE_STATS)
+    )
+    x_var = params.get("x_var") or feat_cfg.get("x_var") or "X"
+    if not isinstance(x_var, str) or not x_var.strip():
+        raise ConfigError("x_var must be a non-empty string.")
+    coverage_var = params.get("coverage_var") or feat_cfg.get("coverage_var") or "coverage"
+    if not isinstance(coverage_var, str) or not coverage_var.strip():
+        raise ConfigError("coverage_var must be a non-empty string.")
+    missing_strategy = _normalize_missing_strategy(
+        params.get("missing_strategy", feat_cfg.get("missing_strategy"))
+    )
+    site_total = _stable_site_total(stable_payload, params)
+    if site_total is None:
+        site_total = 1.0
+    site_tol = _coerce_optional_float(params.get("site_tolerance"), "site_tolerance")
+    if site_tol is None:
+        site_tol = DEFAULT_STABLE_SITE_TOL
+
+    phase_assignment: dict[str, Optional[str]] = {
+        entry["name"]: entry.get("phase") for entry in stable_entries
+    }
+    gas_names: list[str] = []
+    surface_names: list[str] = []
+    time_values = None
+    gas_series_list: list[Any] = []
+    surface_series_list: list[Any] = []
+    rows: list[dict[str, Any]] = []
+
+    for run_index, run_id in enumerate(run_ids):
+        store.read_manifest("runs", run_id)
+        run_dir = store.artifact_dir("runs", run_id)
+        dataset = _load_run_dataset_xr(run_dir)
+
+        if "time" not in dataset.coords:
+            raise ConfigError("Run dataset must include time coord.")
+        current_time = np.asarray(dataset.coords["time"].values)
+        if time_values is None:
+            time_values = current_time
+        else:
+            if len(current_time) != len(time_values) or np.any(
+                np.asarray(current_time) != np.asarray(time_values)
+            ):
+                raise ConfigError("Time grid mismatch across runs.")
+
+        gas_coord = []
+        if "species" in dataset.coords:
+            gas_coord = [str(name) for name in dataset.coords["species"].values]
+        surface_coord = []
+        if "surface_species" in dataset.coords:
+            surface_coord = [str(name) for name in dataset.coords["surface_species"].values]
+
+        if run_index == 0:
+            for name, phase in phase_assignment.items():
+                if phase is None:
+                    if name in gas_coord:
+                        phase_assignment[name] = "gas"
+                    elif name in surface_coord:
+                        phase_assignment[name] = "surface"
+
+            gas_names = [name for name, phase in phase_assignment.items() if phase == "gas"]
+            surface_names = [
+                name for name, phase in phase_assignment.items() if phase == "surface"
+            ]
+
+        missing_names = [
+            name for name, phase in phase_assignment.items() if phase is None
+        ]
+        for name in missing_names:
+            if missing_strategy == "skip":
+                continue
+            for stat in stats:
+                rows.append(
+                    _build_row(
+                        run_id,
+                        f"stable_projection.unknown.{name}.{stat}",
+                        math.nan,
+                        "",
+                        {
+                            "status": "missing_species",
+                            "stable_states_path": stable_path,
+                        },
+                    )
+                )
+
+        if surface_coord and coverage_var in dataset.data_vars:
+            coverage = dataset[coverage_var].transpose("time", "surface_species").values
+            if np.any(coverage < -site_tol) or np.any(coverage > 1.0 + site_tol):
+                raise ConfigError("surface coverage must be within [0, 1].")
+            total_sites = np.sum(coverage, axis=1)
+            if site_total is not None and np.any(
+                np.abs(total_sites - site_total) > site_tol
+            ):
+                raise ConfigError("surface coverage total must be constant.")
+
+        gas_values = None
+        if gas_names:
+            gas_values = np.full((len(current_time), len(gas_names)), np.nan)
+            for idx, name in enumerate(gas_names):
+                series = _extract_series(
+                    dataset,
+                    var_name=x_var,
+                    coord_name="species",
+                    species_name=name,
+                )
+                if series is not None:
+                    gas_values[:, idx] = np.asarray(series, dtype=float)
+                elif missing_strategy != "skip":
+                    for stat in stats:
+                        rows.append(
+                            _build_row(
+                                run_id,
+                                f"stable_projection.gas.{name}.{stat}",
+                                math.nan,
+                                "",
+                                {
+                                    "status": "missing_species",
+                                    "variable": x_var,
+                                    "stable_states_path": stable_path,
+                                },
+                            )
+                        )
+
+        surface_values = None
+        if surface_names:
+            if coverage_var not in dataset.data_vars:
+                raise ConfigError(f"Run dataset missing variable: {coverage_var}")
+            surface_values = np.full((len(current_time), len(surface_names)), np.nan)
+            for idx, name in enumerate(surface_names):
+                series = _extract_series(
+                    dataset,
+                    var_name=coverage_var,
+                    coord_name="surface_species",
+                    species_name=name,
+                )
+                if series is not None:
+                    surface_values[:, idx] = np.asarray(series, dtype=float)
+                elif missing_strategy != "skip":
+                    for stat in stats:
+                        rows.append(
+                            _build_row(
+                                run_id,
+                                f"stable_projection.surface.{name}.{stat}",
+                                math.nan,
+                                "",
+                                {
+                                    "status": "missing_species",
+                                    "variable": coverage_var,
+                                    "stable_states_path": stable_path,
+                                },
+                            )
+                        )
+
+        units = dataset.attrs.get("units", {})
+        if units is None:
+            units = {}
+        if not isinstance(units, Mapping):
+            raise ConfigError("attrs.units must be a mapping when provided.")
+
+        if gas_values is not None:
+            unit = units.get(x_var, "")
+            for idx, name in enumerate(gas_names):
+                series = gas_values[:, idx]
+                if np.isnan(series).all():
+                    continue
+                for stat in stats:
+                    value = _compute_stat(series, time_values, stat)
+                    rows.append(
+                        _build_row(
+                            run_id,
+                            f"stable_projection.gas.{name}.{stat}",
+                            value,
+                            unit,
+                            {
+                                "phase": "gas",
+                                "species": name,
+                                "stat": stat,
+                                "variable": x_var,
+                                "stable_states_path": stable_path,
+                            },
+                        )
+                    )
+
+        if surface_values is not None:
+            unit = units.get(coverage_var, "")
+            for idx, name in enumerate(surface_names):
+                series = surface_values[:, idx]
+                if np.isnan(series).all():
+                    continue
+                for stat in stats:
+                    value = _compute_stat(series, time_values, stat)
+                    rows.append(
+                        _build_row(
+                            run_id,
+                            f"stable_projection.surface.{name}.{stat}",
+                            value,
+                            unit,
+                            {
+                                "phase": "surface",
+                                "species": name,
+                                "stat": stat,
+                                "variable": coverage_var,
+                                "stable_states_path": stable_path,
+                            },
+                        )
+                    )
+
+        if gas_values is not None:
+            gas_series_list.append(gas_values)
+        if surface_values is not None:
+            surface_series_list.append(surface_values)
+
+    data_vars: dict[str, Any] = {}
+    coords: dict[str, Any] = {"time": time_values}
+    if gas_names and gas_series_list:
+        if len(run_ids) > 1:
+            data = np.stack(gas_series_list, axis=0)
+            data_vars["X_stable"] = (("run", "time", "stable_species"), data)
+            coords["run"] = run_ids
+        else:
+            data_vars["X_stable"] = (("time", "stable_species"), gas_series_list[0])
+        coords["stable_species"] = gas_names
+    if surface_names and surface_series_list:
+        if len(run_ids) > 1:
+            data = np.stack(surface_series_list, axis=0)
+            data_vars["coverage_stable"] = (
+                ("run", "time", "stable_surface_species"),
+                data,
+            )
+            coords["run"] = run_ids
+        else:
+            data_vars["coverage_stable"] = (
+                ("time", "stable_surface_species"),
+                surface_series_list[0],
+            )
+        coords["stable_surface_species"] = surface_names
+
+    if not data_vars:
+        raise ConfigError("stable projection produced no time series data.")
+
+    output = xr.Dataset(data_vars=data_vars, coords=coords)
+    output.attrs["stable_states_path"] = stable_path
+    output.attrs["stable_species"] = json.dumps(
+        [entry["name"] for entry in stable_entries],
+        ensure_ascii=True,
+        sort_keys=True,
+    )
+
+    inputs_payload = {
+        "runs": run_ids,
+        "stable_states_path": stable_path,
+        "stable_species": [entry["name"] for entry in stable_entries],
+        "variables": {"x_var": x_var, "coverage_var": coverage_var},
+        "stats": stats,
+    }
+    artifact_id = make_artifact_id(
+        inputs=inputs_payload,
+        config=manifest_cfg,
+        code=_code_metadata(),
+        exclude_keys=("hydra",),
+    )
+    manifest = build_manifest(
+        kind="features",
+        artifact_id=artifact_id,
+        parents=run_ids,
+        inputs=inputs_payload,
+        config=manifest_cfg,
+    )
+
+    def _writer(base_dir: Path) -> None:
+        output.to_zarr(base_dir / "stable_projection_timeseries.zarr", mode="w")
+        _write_features_table(rows, base_dir / "features.parquet")
+
+    return store.ensure(manifest, writer=_writer)
+
+
+def superstate_timeseries(
+    cfg: Mapping[str, Any],
+    *,
+    store: ArtifactStore,
+    registry: Optional[Registry] = None,
+) -> ArtifactCacheResult:
+    """Project species time series onto CNR-Coarse superstates."""
+    if not isinstance(cfg, Mapping):
+        raise ConfigError("cfg must be a mapping.")
+    if np is None:
+        raise ConfigError("numpy is required for superstate timeseries.")
+
+    resolved_cfg = _resolve_cfg(cfg)
+    manifest_cfg, feat_cfg = _extract_features_cfg(resolved_cfg)
+    params = feat_cfg.get("params") or {}
+    if not isinstance(params, Mapping):
+        raise ConfigError("params must be a mapping when provided.")
+    params = dict(params)
+
+    run_ids = _extract_run_ids(feat_cfg, store=store)
+    if not run_ids:
+        raise ConfigError("superstate timeseries requires run_id.")
+
+    mapping_id = _extract_mapping_id(feat_cfg)
+    mapping_payload = _load_mapping_payload(store, mapping_id)
+    superstate_names, mapping_by_name, members_by_id = _resolve_superstate_mapping(
+        mapping_payload
+    )
+
+    x_var = params.get("x_var") or feat_cfg.get("x_var") or "X"
+    if not isinstance(x_var, str) or not x_var.strip():
+        raise ConfigError("x_var must be a non-empty string.")
+    wdot_var = params.get("wdot_var") or feat_cfg.get("wdot_var") or "net_production_rates"
+    if not isinstance(wdot_var, str) or not wdot_var.strip():
+        raise ConfigError("wdot_var must be a non-empty string.")
+    include_wdot = params.get("include_wdot")
+    if include_wdot is None:
+        include_wdot = True
+    if not isinstance(include_wdot, bool):
+        raise ConfigError("include_wdot must be a boolean.")
+
+    species_coord = params.get("species_coord") or feat_cfg.get("species_coord")
+    if species_coord is not None and (
+        not isinstance(species_coord, str) or not species_coord.strip()
+    ):
+        raise ConfigError("species_coord must be a non-empty string.")
+
+    time_values = None
+    series_list: list[Any] = []
+    wdot_list: list[Any] = []
+    for run_id in run_ids:
+        store.read_manifest("runs", run_id)
+        run_dir = store.artifact_dir("runs", run_id)
+        if xr is not None:
+            dataset = _load_run_dataset_xr(run_dir)
+
+            coord_name = species_coord
+            if coord_name is None:
+                coord_name = "species" if "species" in dataset.coords else None
+            if coord_name is None and "surface_species" in dataset.coords:
+                coord_name = "surface_species"
+            if coord_name is None:
+                raise ConfigError("Run dataset must include species coords.")
+
+            if "time" not in dataset.coords:
+                raise ConfigError("Run dataset must include time coord.")
+            current_time = dataset.coords["time"].values
+            if time_values is None:
+                time_values = current_time
+            else:
+                if len(current_time) != len(time_values) or np.any(
+                    np.asarray(current_time) != np.asarray(time_values)
+                ):
+                    raise ConfigError("Time grid mismatch across runs.")
+
+            species_names = [str(name) for name in dataset.coords[coord_name].values]
+            if x_var not in dataset.data_vars:
+                raise ConfigError(f"Run dataset missing variable: {x_var}")
+            x_values = dataset[x_var].transpose("time", coord_name).values
+            if include_wdot:
+                if wdot_var not in dataset.data_vars:
+                    raise ConfigError(f"Run dataset missing variable: {wdot_var}")
+                wdot_values = dataset[wdot_var].transpose("time", coord_name).values
+            else:
+                wdot_values = None
+        else:
+            payload = load_run_dataset_payload(run_dir)
+            coords = payload.get("coords", {})
+            if not isinstance(coords, Mapping):
+                raise ConfigError("Run dataset coords must be a mapping.")
+            coord_name = species_coord
+            if coord_name is None:
+                coord_name = "species" if "species" in coords else None
+            if coord_name is None and "surface_species" in coords:
+                coord_name = "surface_species"
+            if coord_name is None:
+                raise ConfigError("Run dataset must include species coords.")
+
+            time_payload = coords.get("time")
+            if not isinstance(time_payload, Mapping):
+                raise ConfigError("Run dataset must include time coord.")
+            current_time = time_payload.get("data")
+            if not isinstance(current_time, Sequence):
+                raise ConfigError("Run dataset time coord is invalid.")
+            current_time = np.asarray(current_time, dtype=float)
+            if time_values is None:
+                time_values = current_time
+            else:
+                if len(current_time) != len(time_values) or np.any(
+                    np.asarray(current_time) != np.asarray(time_values)
+                ):
+                    raise ConfigError("Time grid mismatch across runs.")
+
+            coord_payload = coords.get(coord_name)
+            if not isinstance(coord_payload, Mapping):
+                raise ConfigError("Run dataset species coord is missing.")
+            species_data = coord_payload.get("data")
+            if not isinstance(species_data, Sequence):
+                raise ConfigError("Run dataset species coord is invalid.")
+            species_names = [str(name) for name in species_data]
+
+            data_vars = payload.get("data_vars", {})
+            if not isinstance(data_vars, Mapping):
+                raise ConfigError("Run dataset data_vars must be a mapping.")
+
+            def _var_to_time_species(var_name: str) -> Any:
+                entry = data_vars.get(var_name)
+                if not isinstance(entry, Mapping):
+                    raise ConfigError(f"Run dataset missing variable: {var_name}")
+                dims = entry.get("dims")
+                data = entry.get("data")
+                if not isinstance(dims, Sequence) or not isinstance(data, Sequence):
+                    raise ConfigError(f"Run dataset variable {var_name} is invalid.")
+                dims_list = [str(d) for d in dims]
+                if "time" not in dims_list or coord_name not in dims_list:
+                    raise ConfigError(
+                        f"Run dataset variable {var_name} missing time/species dims."
+                    )
+                arr = np.asarray(data, dtype=float)
+                time_axis = dims_list.index("time")
+                species_axis = dims_list.index(coord_name)
+                arr = np.moveaxis(arr, [time_axis, species_axis], [0, 1])
+                return arr
+
+            x_values = _var_to_time_species(x_var)
+            wdot_values = _var_to_time_species(wdot_var) if include_wdot else None
+        missing = [name for name in species_names if name not in mapping_by_name]
+        if missing:
+            raise ConfigError(
+                f"Missing species in mapping: {', '.join(missing[:5])}"
+            )
+
+        n_super = len(superstate_names)
+        indicator = np.zeros((len(species_names), n_super), dtype=float)
+        for idx, name in enumerate(species_names):
+            indicator[idx, mapping_by_name[name]] = 1.0
+
+        x_super = np.matmul(x_values, indicator)
+        series_list.append(x_super)
+
+        if include_wdot:
+            wdot_super = np.matmul(wdot_values, indicator)
+            wdot_list.append(wdot_super)
+
+    dims = ("time", "superstate")
+    if len(run_ids) > 1:
+        dims = ("run", "time", "superstate")
+        x_data = np.stack(series_list, axis=0)
+        wdot_data = np.stack(wdot_list, axis=0) if wdot_list else None
+    else:
+        x_data = series_list[0]
+        wdot_data = wdot_list[0] if wdot_list else None
+
+    coords: dict[str, Any] = {
+        "time": time_values,
+        "superstate": superstate_names,
+    }
+    if len(run_ids) > 1:
+        coords["run"] = run_ids
+
+    data_vars: dict[str, Any] = {
+        "X_super": (dims, x_data),
+    }
+    if include_wdot and wdot_data is not None:
+        data_vars["wdot_super"] = (dims, wdot_data)
+
+    attrs = {
+        "mapping_id": mapping_id,
+        "superstate_members": json.dumps(
+            {str(key): value for key, value in members_by_id.items()},
+            ensure_ascii=True,
+            sort_keys=True,
+        ),
+    }
+    output = None
+    if xr is not None:
+        output = xr.Dataset(data_vars=data_vars, coords=coords)
+        output.attrs.update(attrs)
+
+    inputs_payload = {
+        "runs": run_ids,
+        "mapping_id": mapping_id,
+        "variables": {"x_var": x_var, "wdot_var": wdot_var, "include_wdot": include_wdot},
+    }
+    artifact_id = make_artifact_id(
+        inputs=inputs_payload,
+        config=manifest_cfg,
+        code=_code_metadata(),
+        exclude_keys=("hydra",),
+    )
+    manifest = build_manifest(
+        kind="features",
+        artifact_id=artifact_id,
+        parents=list(dict.fromkeys(run_ids + [mapping_id])),
+        inputs=inputs_payload,
+        config=manifest_cfg,
+    )
+
+    def _writer(base_dir: Path) -> None:
+        target = base_dir / "superstate_timeseries.zarr"
+        target.mkdir(parents=True, exist_ok=True)
+        if output is not None:
+            output.to_zarr(target, mode="w")
+            return
+        payload = {
+            "coords": {
+                name: {"dims": [name], "data": np.asarray(values).tolist()}
+                for name, values in coords.items()
+            },
+            "data_vars": {
+                name: {"dims": list(dims), "data": np.asarray(values).tolist()}
+                for name, (dims, values) in data_vars.items()
+            },
+            "attrs": attrs,
+        }
+        write_json_atomic(target / "dataset.json", payload)
+
+    return store.ensure(manifest, writer=_writer)
+
+
+def superstate_qoi(
+    cfg: Mapping[str, Any],
+    *,
+    store: ArtifactStore,
+    registry: Optional[Registry] = None,
+) -> ArtifactCacheResult:
+    """Compute QoIs on superstates defined by a mapping (mapping.json or node_lumping.json).
+
+    This is used to keep QoI comparisons valid even when species are merged/removed
+    by a reduction method.
+    """
+    if not isinstance(cfg, Mapping):
+        raise ConfigError("cfg must be a mapping.")
+    if np is None:
+        raise ConfigError("numpy is required for superstate QoI.")
+
+    resolved_cfg = _resolve_cfg(cfg)
+    manifest_cfg, feat_cfg = _extract_features_cfg(resolved_cfg)
+    params = feat_cfg.get("params") or {}
+    if not isinstance(params, Mapping):
+        raise ConfigError("params must be a mapping when provided.")
+    params = dict(params)
+
+    run_ids = _extract_run_ids(feat_cfg, store=store)
+    if not run_ids:
+        raise ConfigError("superstate QoI requires run_id.")
+    mapping_id = _extract_mapping_id(feat_cfg)
+    mapping_payload = _load_superstate_payload(store, mapping_id)
+    superstate_names, mapping_by_name, _members_by_id = _resolve_superstate_mapping_any(
+        mapping_payload
+    )
+
+    x_var = params.get("x_var") or feat_cfg.get("x_var") or "X"
+    if not isinstance(x_var, str) or not x_var.strip():
+        raise ConfigError("x_var must be a non-empty string.")
+    t_var = params.get("t_var") or feat_cfg.get("t_var") or "T"
+    if not isinstance(t_var, str) or not t_var.strip():
+        raise ConfigError("t_var must be a non-empty string.")
+
+    include_temperature_qoi = params.get("include_temperature_qoi")
+    if include_temperature_qoi is None:
+        include_temperature_qoi = True
+    if not isinstance(include_temperature_qoi, bool):
+        raise ConfigError("include_temperature_qoi must be a boolean.")
+    include_ignition_delay = params.get("include_ignition_delay")
+    if include_ignition_delay is None:
+        include_ignition_delay = True
+    if not isinstance(include_ignition_delay, bool):
+        raise ConfigError("include_ignition_delay must be a boolean.")
+
+    species_coord = params.get("species_coord") or feat_cfg.get("species_coord")
+    if species_coord is not None and (
+        not isinstance(species_coord, str) or not species_coord.strip()
+    ):
+        raise ConfigError("species_coord must be a non-empty string.")
+
+    raw_targets = params.get("targets") or feat_cfg.get("targets")
+    if raw_targets is None:
+        raw_targets = [
+            {"name": "CO_final_super", "member_species": "CO", "stat": "last"},
+            {"name": "CO2_final_super", "member_species": "CO2", "stat": "last"},
+        ]
+    if not isinstance(raw_targets, Sequence) or isinstance(
+        raw_targets, (str, bytes, bytearray)
+    ):
+        raise ConfigError("targets must be a list of mappings.")
+    targets: list[dict[str, str]] = []
+    for idx, entry in enumerate(raw_targets):
+        if not isinstance(entry, Mapping):
+            raise ConfigError(f"targets[{idx}] must be a mapping.")
+        name = entry.get("name") or entry.get("qoi") or entry.get("feature")
+        member = entry.get("member_species") or entry.get("species") or entry.get("member")
+        stat = entry.get("stat") or entry.get("agg") or "last"
+        name = _require_nonempty_str(name, f"targets[{idx}].name")
+        member = _require_nonempty_str(member, f"targets[{idx}].member_species")
+        stat = _require_nonempty_str(stat, f"targets[{idx}].stat").lower()
+        if stat not in DEFAULT_STATS:
+            allowed = ", ".join(DEFAULT_STATS)
+            raise ConfigError(f"targets[{idx}].stat must be one of: {allowed}.")
+        targets.append({"name": name, "member_species": member, "stat": stat})
+    if not targets:
+        raise ConfigError("targets must include at least one entry.")
+
+    def _as_qoi_name(name: str) -> str:
+        cleaned = name.strip()
+        if cleaned.startswith("qoi."):
+            return cleaned
+        return f"qoi.{cleaned}"
+
+    def _ignition_delay(time_values: Sequence[float], temperatures: Sequence[float]) -> float:
+        if len(time_values) != len(temperatures):
+            raise ConfigError("T series length must match time coordinates.")
+        if len(time_values) < 2:
+            return math.nan
+        best_idx = 1
+        best_value = -math.inf
+        for idx in range(1, len(time_values)):
+            dt = float(time_values[idx]) - float(time_values[idx - 1])
+            if dt <= 0.0:
+                dt = 1.0e-12
+            dTdt = (float(temperatures[idx]) - float(temperatures[idx - 1])) / dt
+            if dTdt > best_value:
+                best_value = dTdt
+                best_idx = idx
+        return float(time_values[best_idx])
+
+    rows: list[dict[str, Any]] = []
+    for run_id in run_ids:
+        store.read_manifest("runs", run_id)
+        run_dir = store.artifact_dir("runs", run_id)
+        species_names: list[str] = []
+        time_values: list[float] = []
+        x_values: Any = None
+        t_values: Optional[Any] = None
+        units: Mapping[str, Any] = {}
+        coord_name = species_coord
+
+        if xr is not None:
+            dataset = _load_run_dataset_xr(run_dir)
+
+            if coord_name is None:
+                coord_name = "species" if "species" in dataset.coords else None
+            if coord_name is None and "surface_species" in dataset.coords:
+                coord_name = "surface_species"
+            if coord_name is None:
+                raise ConfigError("Run dataset must include species coords.")
+            if "time" not in dataset.coords:
+                raise ConfigError("Run dataset must include time coord.")
+
+            time_values = _coerce_float_sequence(
+                dataset.coords["time"].values.tolist(),
+                "coords.time",
+            )
+            species_names = [str(name) for name in dataset.coords[coord_name].values]
+            if not species_names:
+                raise ConfigError("Run dataset species coord is empty.")
+            if x_var not in dataset.data_vars:
+                raise ConfigError(f"Run dataset missing variable: {x_var}")
+            x_values = np.asarray(
+                dataset[x_var].transpose("time", coord_name).values, dtype=float
+            )
+            if x_values.shape[0] != len(time_values) or x_values.shape[1] != len(
+                species_names
+            ):
+                raise ConfigError("X dims must match time/species coordinates.")
+
+            if include_temperature_qoi or include_ignition_delay:
+                if t_var not in dataset.data_vars:
+                    raise ConfigError(f"Run dataset missing variable: {t_var}")
+                t_values = np.asarray(
+                    dataset[t_var].transpose("time").values, dtype=float
+                )
+                if t_values.shape[0] != len(time_values):
+                    raise ConfigError("T dims must match time coordinates.")
+
+            units = dataset.attrs.get("units", {})
+            if units is None:
+                units = {}
+            if not isinstance(units, Mapping):
+                raise ConfigError("attrs.units must be a mapping when provided.")
+        else:
+            payload = load_run_dataset_payload(run_dir)
+            coords_payload = payload.get("coords", {})
+            if not isinstance(coords_payload, Mapping):
+                raise ConfigError("Run dataset coords must be a mapping.")
+            data_vars_payload = payload.get("data_vars", {})
+            if not isinstance(data_vars_payload, Mapping):
+                raise ConfigError("Run dataset data_vars must be a mapping.")
+
+            if coord_name is None:
+                coord_name = "species" if "species" in coords_payload else None
+            if coord_name is None and "surface_species" in coords_payload:
+                coord_name = "surface_species"
+            if coord_name is None:
+                raise ConfigError("Run dataset must include species coords.")
+
+            time_entry = coords_payload.get("time")
+            if not isinstance(time_entry, Mapping):
+                raise ConfigError("Run dataset must include time coord.")
+            time_values = _coerce_float_sequence(time_entry.get("data"), "coords.time")
+
+            species_entry = coords_payload.get(coord_name)
+            if not isinstance(species_entry, Mapping):
+                raise ConfigError("Run dataset species coord is missing.")
+            species_names = _coerce_str_sequence(species_entry.get("data"), "coords.species")
+
+            def _var_to_time_species(var_name: str) -> Any:
+                entry = data_vars_payload.get(var_name)
+                if not isinstance(entry, Mapping):
+                    raise ConfigError(f"Run dataset missing variable: {var_name}")
+                dims = entry.get("dims")
+                data = entry.get("data")
+                if not isinstance(dims, Sequence) or not isinstance(data, Sequence):
+                    raise ConfigError(f"Run dataset variable {var_name} is invalid.")
+                dims_list = [str(d) for d in dims]
+                if "time" not in dims_list or coord_name not in dims_list:
+                    raise ConfigError(
+                        f"Run dataset variable {var_name} missing time/species dims."
+                    )
+                arr = np.asarray(data, dtype=float)
+                time_axis = dims_list.index("time")
+                species_axis = dims_list.index(coord_name)
+                arr = np.moveaxis(arr, [time_axis, species_axis], [0, 1])
+                return arr
+
+            def _var_to_time(var_name: str) -> Any:
+                entry = data_vars_payload.get(var_name)
+                if not isinstance(entry, Mapping):
+                    raise ConfigError(f"Run dataset missing variable: {var_name}")
+                dims = entry.get("dims")
+                data = entry.get("data")
+                if not isinstance(dims, Sequence) or not isinstance(data, Sequence):
+                    raise ConfigError(f"Run dataset variable {var_name} is invalid.")
+                dims_list = [str(d) for d in dims]
+                if dims_list != ["time"]:
+                    raise ConfigError(f"Run dataset variable {var_name} must be time-series.")
+                return np.asarray(data, dtype=float)
+
+            x_values = _var_to_time_species(x_var)
+            if include_temperature_qoi or include_ignition_delay:
+                t_values = _var_to_time(t_var)
+
+            attrs_payload = payload.get("attrs", {})
+            if not isinstance(attrs_payload, Mapping):
+                attrs_payload = {}
+            units = attrs_payload.get("units", {})
+            if units is None:
+                units = {}
+            if not isinstance(units, Mapping):
+                raise ConfigError("attrs.units must be a mapping when provided.")
+
+        if t_values is not None and len(t_values) != len(time_values):
+            raise ConfigError("T series length must match time coordinates.")
+
+        missing_map = [name for name in species_names if name not in mapping_by_name]
+        if missing_map:
+            raise ConfigError(f"Missing species in mapping: {', '.join(missing_map[:5])}")
+
+        x_unit = "" if units.get(x_var) is None else str(units.get(x_var))
+        t_unit = "" if units.get(t_var) is None else str(units.get(t_var))
+        time_unit = "" if units.get("time") is None else str(units.get("time"))
+
+        for target in targets:
+            member = target["member_species"]
+            if member not in mapping_by_name:
+                raise ConfigError(f"member_species not found in mapping: {member}")
+            sid = int(mapping_by_name[member])
+            sname = (
+                superstate_names[sid]
+                if 0 <= sid < len(superstate_names)
+                else f"S{sid:03d}"
+            )
+            indices = [
+                idx for idx, name in enumerate(species_names) if mapping_by_name[name] == sid
+            ]
+            if not indices:
+                raise ConfigError(
+                    f"No species from superstate {sname} (id={sid}) are present in run dataset."
+                )
+            series = np.sum(x_values[:, indices], axis=1)
+            value = _compute_stat(series, time_values, target["stat"])
+            rows.append(
+                {
+                    "run_id": run_id,
+                    "feature": _as_qoi_name(target["name"]),
+                    "value": float(value),
+                    "unit": x_unit,
+                    "meta_json": json.dumps(
+                        {
+                            "mapping_id": mapping_id,
+                            "member_species": member,
+                            "superstate_id": sid,
+                            "superstate_name": sname,
+                            "stat": target["stat"],
+                            "variable": x_var,
+                        },
+                        ensure_ascii=True,
+                        sort_keys=True,
+                    ),
+                }
+            )
+
+        if include_temperature_qoi and t_values is not None:
+            rows.append(
+                {
+                    "run_id": run_id,
+                    "feature": "qoi.T_peak",
+                    "value": float(np.nanmax(t_values)),
+                    "unit": t_unit,
+                    "meta_json": json.dumps(
+                        {"method": "max", "variable": t_var},
+                        ensure_ascii=True,
+                        sort_keys=True,
+                    ),
+                }
+            )
+        if include_ignition_delay and t_values is not None:
+            tau = _ignition_delay(time_values, np.asarray(t_values, dtype=float).tolist())
+            rows.append(
+                {
+                    "run_id": run_id,
+                    "feature": "qoi.ignition_delay",
+                    "value": float(tau),
+                    "unit": time_unit,
+                    "meta_json": json.dumps(
+                        {"method": "max_dTdt_prev_point", "variable": t_var},
+                        ensure_ascii=True,
+                        sort_keys=True,
+                    ),
+                }
+            )
+
+    inputs_payload = {
+        "runs": run_ids,
+        "mapping_id": mapping_id,
+        "targets": list(targets),
+        "variables": {"x_var": x_var, "t_var": t_var, "species_coord": species_coord},
+        "include_temperature_qoi": include_temperature_qoi,
+        "include_ignition_delay": include_ignition_delay,
+    }
+    artifact_id = make_artifact_id(
+        inputs=inputs_payload,
+        config=manifest_cfg,
+        code=_code_metadata(),
+        exclude_keys=("hydra",),
+    )
+    manifest = build_manifest(
+        kind="features",
+        artifact_id=artifact_id,
+        parents=list(dict.fromkeys(run_ids + [mapping_id])),
+        inputs=inputs_payload,
+        config=manifest_cfg,
+    )
+
+    def _writer(base_dir: Path) -> None:
+        _write_features_table(rows, base_dir / "features.parquet")
+
+    return store.ensure(manifest, writer=_writer)
+
+
+def superstate_merge_quality(
+    cfg: Mapping[str, Any],
+    *,
+    store: ArtifactStore,
+    registry: Optional[Registry] = None,
+) -> ArtifactCacheResult:
+    """Evaluate a superstate mapping against a RunArtifact (projection-only).
+
+    This task does not change the simulation; it reports information-loss / plausibility
+    indicators for a given mapping when projected onto a specific run dataset.
+    """
+    if not isinstance(cfg, Mapping):
+        raise ConfigError("cfg must be a mapping.")
+    if np is None:
+        raise ConfigError("numpy is required for superstate merge quality.")
+
+    resolved_cfg = _resolve_cfg(cfg)
+    manifest_cfg, feat_cfg = _extract_features_cfg(resolved_cfg)
+    params = feat_cfg.get("params") or {}
+    if params is None:
+        params = {}
+    if not isinstance(params, Mapping):
+        raise ConfigError("params must be a mapping when provided.")
+    params = dict(params)
+
+    run_ids = _extract_run_ids(feat_cfg, store=store)
+    if not run_ids:
+        raise ConfigError("superstate_merge_quality requires run_id.")
+    mapping_id = _extract_mapping_id(feat_cfg)
+    mapping_payload = _load_superstate_payload(store, mapping_id)
+    superstate_names, mapping_by_name, members_by_id = _resolve_superstate_mapping_any(
+        mapping_payload
+    )
+
+    x_var = params.get("x_var") or feat_cfg.get("x_var") or "X"
+    if not isinstance(x_var, str) or not x_var.strip():
+        raise ConfigError("x_var must be a non-empty string.")
+    species_coord = params.get("species_coord") or feat_cfg.get("species_coord")
+    if species_coord is not None and (
+        not isinstance(species_coord, str) or not species_coord.strip()
+    ):
+        raise ConfigError("species_coord must be a non-empty string.")
+
+    kind_by_species: dict[str, str] = {}
+    elements_by_species: dict[str, set[str]] = {}
+    rep_by_super: dict[int, str] = {}
+    # Optional extra metadata emitted by reduction.superstate_mapping.
+    if isinstance(mapping_payload.get("composition_meta"), Sequence) and not isinstance(
+        mapping_payload.get("composition_meta"),
+        (str, bytes, bytearray),
+    ):
+        for entry in mapping_payload.get("composition_meta") or []:
+            if not isinstance(entry, Mapping):
+                continue
+            name = entry.get("species")
+            if not isinstance(name, str) or not name.strip():
+                continue
+            kind = entry.get("kind")
+            if isinstance(kind, str) and kind.strip():
+                kind_by_species[name.strip()] = kind.strip()
+            elements = entry.get("elements")
+            if isinstance(elements, Mapping):
+                elements_by_species[name.strip()] = {
+                    str(k) for k, v in elements.items() if v is not None and float(v) != 0.0
+                }
+    clusters = mapping_payload.get("clusters") or mapping_payload.get("superstates") or []
+    if isinstance(clusters, Sequence) and not isinstance(clusters, (str, bytes, bytearray)):
+        for cluster in clusters:
+            if not isinstance(cluster, Mapping):
+                continue
+            sid = cluster.get("superstate_id")
+            rep = cluster.get("representative")
+            if isinstance(sid, int) and isinstance(rep, str) and rep.strip():
+                rep_by_super[int(sid)] = rep.strip()
+
+    def _integrate_series(time_values: Sequence[float], matrix: Any) -> Any:
+        arr = np.asarray(matrix, dtype=float)
+        if arr.ndim != 2:
+            raise ConfigError("X variable must be a 2D time x species array.")
+        if len(time_values) != arr.shape[0]:
+            raise ConfigError("time coord length must match X time dimension.")
+        if arr.shape[0] < 2:
+            return np.zeros((arr.shape[1],), dtype=float)
+        times = np.asarray(list(time_values), dtype=float)
+        dt = np.diff(times)
+        dt = np.where(dt > 0.0, dt, 1.0e-12)
+        avg = 0.5 * (arr[1:, :] + arr[:-1, :])
+        return np.sum(avg * dt[:, None], axis=0)
+
+    def _entropy_effective(p: Any) -> float:
+        probs = np.asarray(p, dtype=float)
+        probs = probs[probs > 0.0]
+        if probs.size == 0:
+            return 0.0
+        entropy = -float(np.sum(probs * np.log(probs)))
+        return float(math.exp(entropy))
+
+    rows: list[dict[str, Any]] = []
+    for run_id in run_ids:
+        store.read_manifest("runs", run_id)
+        run_dir = store.artifact_dir("runs", run_id)
+        units: Mapping[str, Any] = {}
+
+        coord_name = species_coord
+        if xr is not None:
+            dataset = _load_run_dataset_xr(run_dir)
+            if coord_name is None:
+                coord_name = "species" if "species" in dataset.coords else None
+            if coord_name is None and "surface_species" in dataset.coords:
+                coord_name = "surface_species"
+            if coord_name is None:
+                raise ConfigError("Run dataset must include species coords.")
+            if "time" not in dataset.coords:
+                raise ConfigError("Run dataset must include time coord.")
+            time_values = _coerce_float_sequence(
+                dataset.coords["time"].values.tolist(),
+                "coords.time",
+            )
+            species_names = [str(name) for name in dataset.coords[coord_name].values]
+            if x_var not in dataset.data_vars:
+                raise ConfigError(f"Run dataset missing variable: {x_var}")
+            x_values = np.asarray(
+                dataset[x_var].transpose("time", coord_name).values, dtype=float
+            )
+            units = dataset.attrs.get("units", {}) or {}
+        else:
+            payload = load_run_dataset_payload(run_dir)
+            coords_payload = payload.get("coords", {})
+            if not isinstance(coords_payload, Mapping):
+                raise ConfigError("Run dataset coords must be a mapping.")
+            data_vars_payload = payload.get("data_vars", {})
+            if not isinstance(data_vars_payload, Mapping):
+                raise ConfigError("Run dataset data_vars must be a mapping.")
+            if coord_name is None:
+                coord_name = "species" if "species" in coords_payload else None
+            if coord_name is None and "surface_species" in coords_payload:
+                coord_name = "surface_species"
+            if coord_name is None:
+                raise ConfigError("Run dataset must include species coords.")
+            time_entry = coords_payload.get("time")
+            if not isinstance(time_entry, Mapping):
+                raise ConfigError("Run dataset must include time coord.")
+            time_values = _coerce_float_sequence(time_entry.get("data"), "coords.time")
+            species_entry = coords_payload.get(coord_name)
+            if not isinstance(species_entry, Mapping):
+                raise ConfigError("Run dataset species coord is missing.")
+            species_names = _coerce_str_sequence(species_entry.get("data"), "coords.species")
+            var_entry = data_vars_payload.get(x_var)
+            if not isinstance(var_entry, Mapping):
+                raise ConfigError(f"Run dataset missing variable: {x_var}")
+            dims = var_entry.get("dims")
+            data = var_entry.get("data")
+            if not isinstance(dims, Sequence) or not isinstance(data, Sequence):
+                raise ConfigError(f"Run dataset variable {x_var} is invalid.")
+            dims_list = [str(d) for d in dims]
+            if "time" not in dims_list or coord_name not in dims_list:
+                raise ConfigError(f"Run dataset variable {x_var} missing time/species dims.")
+            arr = np.asarray(data, dtype=float)
+            time_axis = dims_list.index("time")
+            species_axis = dims_list.index(coord_name)
+            x_values = np.moveaxis(arr, [time_axis, species_axis], [0, 1])
+            attrs_payload = payload.get("attrs", {}) or {}
+            if isinstance(attrs_payload, Mapping):
+                units = attrs_payload.get("units", {}) or {}
+            else:
+                units = {}
+
+        missing_map = [name for name in species_names if name not in mapping_by_name]
+        if missing_map:
+            raise ConfigError(f"Missing species in mapping: {', '.join(missing_map[:5])}")
+
+        integrals = _integrate_series(time_values, x_values)
+        species_integral = {name: float(integrals[idx]) for idx, name in enumerate(species_names)}
+
+        purity_values: list[float] = []
+        effective_values: list[float] = []
+        per_super: list[dict[str, Any]] = []
+        kind_mismatch = 0
+        element_overlap_violations = 0
+
+        for sid in range(len(superstate_names)):
+            members = members_by_id.get(sid, [])
+            if not members:
+                continue
+            member_ints = np.asarray([species_integral.get(name, 0.0) for name in members], dtype=float)
+            total = float(np.sum(member_ints))
+            if total <= 0.0:
+                purity = 1.0
+                effective = 0.0
+            else:
+                purity = float(np.max(member_ints) / total)
+                effective = _entropy_effective(member_ints / total)
+            purity_values.append(purity)
+            effective_values.append(effective)
+            per_super.append(
+                {
+                    "superstate_id": int(sid),
+                    "superstate": (
+                        superstate_names[sid]
+                        if 0 <= sid < len(superstate_names)
+                        else f"S{sid:03d}"
+                    ),
+                    "members": list(members),
+                    "member_count": int(len(members)),
+                    "purity": float(purity),
+                    "effective_species": float(effective),
+                    "integral_total": float(total),
+                }
+            )
+
+            # Optional guard-violation checks when metadata exists.
+            if kind_by_species:
+                kinds = {kind_by_species.get(name, "unknown") for name in members}
+                if len(kinds) > 1:
+                    kind_mismatch += 1
+            if elements_by_species and rep_by_super:
+                rep = rep_by_super.get(sid)
+                if rep is not None:
+                    rep_set = elements_by_species.get(rep, set())
+                    if rep_set:
+                        for name in members:
+                            if name == rep:
+                                continue
+                            if not (rep_set & elements_by_species.get(name, set())):
+                                element_overlap_violations += 1
+
+        purity_mean = float(sum(purity_values) / len(purity_values)) if purity_values else math.nan
+        purity_max = float(max(purity_values)) if purity_values else math.nan
+        eff_mean = float(sum(effective_values) / len(effective_values)) if effective_values else math.nan
+        eff_max = float(max(effective_values)) if effective_values else math.nan
+
+        super_count = int(len(superstate_names))
+        sp_count = int(len(species_names))
+        coverage = 1.0
+        compression_ratio = float(super_count) / float(sp_count) if sp_count else math.nan
+
+        meta_common = {"mapping_id": mapping_id, "x_var": x_var, "species_coord": coord_name}
+
+        def _row(
+            feature: str,
+            value: float,
+            *,
+            unit: str = "",
+            extra: Optional[dict[str, Any]] = None,
+        ) -> dict[str, Any]:
+            meta = dict(meta_common)
+            if extra:
+                meta.update(extra)
+            return {
+                "run_id": run_id,
+                "feature": feature,
+                "value": float(value),
+                "unit": unit,
+                "meta_json": json.dumps(meta, ensure_ascii=True, sort_keys=True),
+            }
+
+        rows.append(_row("merge.coverage", coverage))
+        rows.append(_row("merge.superstate_count", float(super_count), unit="count", extra={"stat": "count"}))
+        rows.append(_row("merge.compression_ratio", compression_ratio))
+        rows.append(_row("merge.cluster_purity.mean", purity_mean))
+        rows.append(_row("merge.cluster_purity.max", purity_max))
+        rows.append(_row("merge.cluster_effective_species.mean", eff_mean))
+        rows.append(_row("merge.cluster_effective_species.max", eff_max))
+        rows.append(_row("merge.kind_mismatch_count", float(kind_mismatch), unit="count"))
+        rows.append(_row("merge.element_overlap_violations", float(element_overlap_violations), unit="count"))
+
+        # Per-superstate details for downstream "repair" steps.
+        for entry in per_super:
+            sid = entry["superstate_id"]
+            sname = entry["superstate"]
+            member_count = entry["member_count"]
+            meta = {
+                "mapping_id": mapping_id,
+                "x_var": x_var,
+                "species_coord": coord_name,
+                "superstate_id": sid,
+                "superstate": sname,
+                "member_count": member_count,
+            }
+            rows.append(
+                {
+                    "run_id": run_id,
+                    "feature": "merge.superstate_purity",
+                    "value": float(entry["purity"]),
+                    "unit": "",
+                    "meta_json": json.dumps(meta, ensure_ascii=True, sort_keys=True),
+                }
+            )
+            rows.append(
+                {
+                    "run_id": run_id,
+                    "feature": "merge.superstate_effective_species",
+                    "value": float(entry["effective_species"]),
+                    "unit": "count",
+                    "meta_json": json.dumps(meta, ensure_ascii=True, sort_keys=True),
+                }
+            )
+            rows.append(
+                {
+                    "run_id": run_id,
+                    "feature": "merge.superstate_integral_total",
+                    "value": float(entry["integral_total"]),
+                    "unit": "",
+                    "meta_json": json.dumps(meta, ensure_ascii=True, sort_keys=True),
+                }
+            )
+
+    inputs_payload = {
+        "runs": run_ids,
+        "mapping_id": mapping_id,
+        "x_var": x_var,
+        "species_coord": species_coord,
+    }
+    artifact_id = make_artifact_id(
+        inputs=inputs_payload,
+        config=manifest_cfg,
+        code=_code_metadata(),
+        exclude_keys=("hydra",),
+    )
+    manifest = build_manifest(
+        kind="features",
+        artifact_id=artifact_id,
+        parents=list(dict.fromkeys(run_ids + [mapping_id])),
+        inputs=inputs_payload,
+        config=manifest_cfg,
+    )
+
+    def _writer(base_dir: Path) -> None:
+        _write_features_table(rows, base_dir / "features.parquet")
+
+    return store.ensure(manifest, writer=_writer)
+
+
+def reduction_cheap_metrics(
+    cfg: Mapping[str, Any],
+    *,
+    store: ArtifactStore,
+    registry: Optional[Registry] = None,
+) -> ArtifactCacheResult:
+    """Compute reduction "cheap" metrics from TemporalFluxGraph reaction activity.
+
+    This task does not re-simulate. It provides fast, method-agnostic proxies such as:
+      - cheap.flux_coverage_retained (activity-weighted retention under multipliers)
+      - cheap.top_path_jaccard (Top-K reaction set overlap proxy)
+
+    Inputs:
+      - graph_flux_id: GraphArtifact id (graphs.temporal_flux output)
+      - patches: list of reduction artifact ids (each should include mechanism_patch.yaml)
+    """
+    if not isinstance(cfg, Mapping):
+        raise ConfigError("cfg must be a mapping.")
+    if np is None:
+        raise ConfigError("numpy is required for reduction cheap metrics.")
+
+    resolved_cfg = _resolve_cfg(cfg)
+    manifest_cfg, feat_cfg = _extract_features_cfg(resolved_cfg)
+    inputs = feat_cfg.get("inputs") or {}
+    if inputs is None:
+        inputs = {}
+    if not isinstance(inputs, Mapping):
+        raise ConfigError("inputs must be a mapping when provided.")
+    inputs = dict(inputs)
+    params = feat_cfg.get("params") or {}
+    if params is None:
+        params = {}
+    if not isinstance(params, Mapping):
+        raise ConfigError("params must be a mapping when provided.")
+    params = dict(params)
+
+    graph_flux_id = (
+        inputs.get("graph_flux_id")
+        or inputs.get("graph_id")
+        or inputs.get("graph")
+        or feat_cfg.get("graph_flux_id")
+        or feat_cfg.get("graph_id")
+    )
+    graph_flux_id = _require_nonempty_str(graph_flux_id, "graph_flux_id")
+    store.read_manifest("graphs", graph_flux_id)
+    graph_dir = store.artifact_dir("graphs", graph_flux_id)
+    graph_payload = read_json(graph_dir / "graph.json")
+    if not isinstance(graph_payload, Mapping):
+        raise ConfigError("TemporalFluxGraph graph.json must be a mapping.")
+
+    reactions_section = graph_payload.get("reactions") or {}
+    reaction_order: list[str] = []
+    if isinstance(reactions_section, Mapping):
+        order = reactions_section.get("order")
+        if isinstance(order, Sequence) and not isinstance(order, (str, bytes, bytearray)):
+            reaction_order = [str(item) for item in order]
+
+    activity_values: list[float] = []
+    activity_section = (
+        (graph_payload.get("reaction_stats") or {}).get("activity") if isinstance(graph_payload.get("reaction_stats"), Mapping) else None
+    )
+    if isinstance(activity_section, Mapping):
+        values = activity_section.get("values")
+        if isinstance(values, Sequence) and not isinstance(values, (str, bytes, bytearray)):
+            try:
+                activity_values = [float(v) for v in values]
+            except (TypeError, ValueError) as exc:
+                raise ConfigError("reaction_stats.activity.values must be numeric.") from exc
+    if not activity_values:
+        raise ConfigError("TemporalFluxGraph is missing reaction_stats.activity.values.")
+
+    n_reactions = len(activity_values)
+    if reaction_order and len(reaction_order) != n_reactions:
+        raise ConfigError("TemporalFluxGraph reactions.order length mismatch.")
+
+    total_activity = float(sum(activity_values))
+    if total_activity <= 0.0:
+        total_activity = 0.0
+
+    patches_raw = inputs.get("patches") or inputs.get("patch_ids") or inputs.get("reductions") or []
+    patch_ids: list[str] = []
+    if isinstance(patches_raw, str):
+        patch_ids = [_require_nonempty_str(patches_raw, "patches")]
+    elif isinstance(patches_raw, Sequence) and not isinstance(
+        patches_raw, (str, bytes, bytearray)
+    ):
+        patch_ids = [
+            _require_nonempty_str(item, "patches")
+            for item in patches_raw
+            if item is not None
+        ]
+    else:
+        raise ConfigError("patches must be a string or list of strings.")
+    patch_ids = [pid for pid in patch_ids if pid]
+    if not patch_ids:
+        raise ConfigError("patches must include at least one reduction id.")
+
+    top_k_raw = params.get("top_k", params.get("top_n", 50))
+    if isinstance(top_k_raw, bool):
+        raise ConfigError("top_k must be an integer.")
+    try:
+        top_k = int(top_k_raw)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("top_k must be an integer.") from exc
+    if top_k <= 0:
+        raise ConfigError("top_k must be positive.")
+    top_k = min(top_k, n_reactions) if n_reactions else top_k
+
+    # Baseline Top-K reactions by activity.
+    base_scores = np.asarray(activity_values, dtype=float)
+    base_order = sorted(
+        range(n_reactions),
+        key=lambda idx: (-float(base_scores[idx]), int(idx)),
+    )
+    base_top = set(base_order[:top_k])
+
+    reaction_index_by_id: dict[str, int] = {}
+    if reaction_order:
+        for idx, rid in enumerate(reaction_order):
+            if rid not in reaction_index_by_id:
+                reaction_index_by_id[rid] = int(idx)
+
+    def _effective_multiplier(raw: float) -> float:
+        if not math.isfinite(raw):
+            return 0.0
+        value = abs(float(raw))
+        if value <= 0.0:
+            return 0.0
+        # Treat this as a "retention" proxy, not amplification.
+        return min(1.0, value)
+
+    source_runs = graph_payload.get("source")
+    run_id = "unknown"
+    if isinstance(source_runs, Mapping):
+        raw = source_runs.get("run_ids") or []
+        if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes, bytearray)) and raw:
+            first = raw[0]
+            if isinstance(first, str) and first.strip():
+                run_id = first.strip()
+
+    rows: list[dict[str, Any]] = []
+    for patch_id in patch_ids:
+        reduction_id = str(patch_id)
+        patch_path = store.artifact_dir("reduction", reduction_id) / "mechanism_patch.yaml"
+        patch_payload: Mapping[str, Any] = {}
+        status = "ok"
+        if patch_path.exists():
+            patch_raw = read_yaml_payload(patch_path)
+            if isinstance(patch_raw, Mapping):
+                patch_payload = dict(patch_raw)
+            else:
+                status = "invalid_patch"
+        else:
+            status = "missing_patch"
+
+        multipliers_vec = [1.0 for _ in range(n_reactions)]
+        if status == "ok":
+            try:
+                specs = normalize_reaction_multipliers(dict(patch_payload))
+            except Exception:
+                specs = []
+                status = "invalid_patch"
+            for entry in specs:
+                if not isinstance(entry, Mapping):
+                    continue
+                multiplier_raw = entry.get("multiplier", 1.0)
+                try:
+                    multiplier = float(multiplier_raw)
+                except (TypeError, ValueError):
+                    continue
+                if "index" in entry:
+                    idx = entry.get("index")
+                    if isinstance(idx, bool) or idx is None:
+                        continue
+                    try:
+                        idx_int = int(idx)
+                    except (TypeError, ValueError):
+                        continue
+                    if 0 <= idx_int < n_reactions:
+                        multipliers_vec[idx_int] = float(multiplier)
+                else:
+                    rid = entry.get("reaction_id")
+                    if not isinstance(rid, str) or not rid.strip():
+                        continue
+                    mapped = reaction_index_by_id.get(rid.strip())
+                    if mapped is None:
+                        continue
+                    multipliers_vec[mapped] = float(multiplier)
+
+        if status == "ok":
+            eff = np.asarray([_effective_multiplier(v) for v in multipliers_vec], dtype=float)
+            weighted = base_scores * eff
+
+            retained = float(np.sum(weighted)) / total_activity if total_activity > 0.0 else math.nan
+            reduced_order = sorted(
+                range(n_reactions),
+                key=lambda idx: (-float(weighted[idx]), int(idx)),
+            )
+            reduced_top = set(reduced_order[:top_k])
+            union = base_top | reduced_top
+            jaccard = (len(base_top & reduced_top) / float(len(union))) if union else math.nan
+        else:
+            retained = math.nan
+            jaccard = math.nan
+
+        meta_common = {
+            "graph_flux_id": graph_flux_id,
+            "reduction_id": reduction_id,
+            "top_k": int(top_k),
+            "status": status,
+        }
+
+        def _emit(feature: str, value: float, unit: str = "") -> None:
+            rows.append(
+                {
+                    "run_id": run_id,
+                    "feature": feature,
+                    "value": float(value),
+                    "unit": unit,
+                    "meta_json": json.dumps(meta_common, ensure_ascii=True, sort_keys=True),
+                }
+            )
+
+        _emit("cheap.flux_coverage_retained", retained)
+        _emit("cheap.top_path_jaccard", jaccard)
+
+    inputs_payload = {
+        "graph_flux_id": graph_flux_id,
+        "patches": list(patch_ids),
+        "top_k": int(top_k),
+    }
+    artifact_id = make_artifact_id(
+        inputs=inputs_payload,
+        config=manifest_cfg,
+        code=_code_metadata(),
+        exclude_keys=("hydra",),
+    )
+    manifest = build_manifest(
+        kind="features",
+        artifact_id=artifact_id,
+        parents=list(dict.fromkeys([graph_flux_id] + list(patch_ids))),
+        inputs=inputs_payload,
+        config=manifest_cfg,
+    )
+
+    def _writer(base_dir: Path) -> None:
+        _write_features_table(rows, base_dir / "features.parquet")
+
+    return store.ensure(manifest, writer=_writer)
+
+
+def _normalize_feature_norm(value: Any) -> str:
+    if value is None:
+        return "mean_abs"
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError("gnn.feature_norm must be a non-empty string.")
+    normalized = value.strip().lower()
+    if normalized in {"mean_abs", "mean"}:
+        return "mean_abs"
+    if normalized in {"l1", "sum_abs"}:
+        return "l1"
+    if normalized in {"l2", "norm"}:
+        return "l2"
+    raise ConfigError("gnn.feature_norm must be one of: mean_abs, l1, l2.")
+
+
+def _gnn_base_scores(
+    features: Sequence[Sequence[Any]],
+    *,
+    norm: str,
+) -> list[float]:
+    scores: list[float] = []
+    for row in features:
+        if isinstance(row, (str, bytes, bytearray)) or not isinstance(row, Sequence):
+            scores.append(0.0)
+            continue
+        values: list[float] = []
+        for entry in row:
+            try:
+                values.append(float(entry))
+            except (TypeError, ValueError):
+                values.append(0.0)
+        if not values:
+            scores.append(0.0)
+            continue
+        if norm == "l1":
+            scores.append(sum(abs(v) for v in values))
+        elif norm == "l2":
+            scores.append(math.sqrt(sum(v * v for v in values)))
+        else:
+            scores.append(sum(abs(v) for v in values) / float(len(values)))
+    return scores
+
+
+def _gnn_message_passing(
+    base_scores: Sequence[float],
+    *,
+    edges: Sequence[tuple[int, int, float]],
+    steps: int,
+    alpha: float,
+    normalize: bool,
+    undirected: bool,
+) -> list[float]:
+    node_count = len(base_scores)
+    if node_count == 0:
+        return []
+    row_sum = [0.0 for _ in range(node_count)]
+    if normalize:
+        for src, dst, weight in edges:
+            if 0 <= src < node_count and 0 <= dst < node_count:
+                row_sum[src] += abs(weight)
+                if undirected and src != dst:
+                    row_sum[dst] += abs(weight)
+        row_sum = [value if value > 0.0 else 1.0 for value in row_sum]
+    scores = [float(value) for value in base_scores]
+    for _ in range(max(steps, 0)):
+        neighbor = [0.0 for _ in range(node_count)]
+        for src, dst, weight in edges:
+            if 0 <= src < node_count and 0 <= dst < node_count:
+                w = abs(weight)
+                neighbor[src] += w * scores[dst]
+                if undirected and src != dst:
+                    neighbor[dst] += w * scores[src]
+        if normalize:
+            neighbor = [value / row_sum[idx] for idx, value in enumerate(neighbor)]
+        scores = [
+            float(base_scores[idx]) + alpha * neighbor[idx]
+            for idx in range(node_count)
+        ]
+    return scores
+
+
+def _extract_window_entries(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    windows = payload.get("windows")
+    if not isinstance(windows, Sequence) or isinstance(windows, (str, bytes, bytearray)):
+        raise ConfigError("gnn dataset windows must be a list.")
+    entries: list[dict[str, Any]] = []
+    for entry in windows:
+        if not isinstance(entry, Mapping):
+            continue
+        window_meta = entry.get("window") or {}
+        if window_meta is None:
+            window_meta = {}
+        if not isinstance(window_meta, Mapping):
+            raise ConfigError("gnn dataset window metadata must be a mapping.")
+        window_id = entry.get("index", entry.get("window_id"))
+        if window_id is None:
+            window_id = len(entries)
+        try:
+            window_id = int(window_id)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError("gnn dataset window index must be an integer.") from exc
+        start_idx = int(window_meta.get("start_idx", 0))
+        end_idx = int(window_meta.get("end_idx", start_idx))
+        entries.append(
+            {
+                "window_id": window_id,
+                "start_idx": start_idx,
+                "end_idx": end_idx,
+                "window": dict(window_meta),
+            }
+        )
+    if not entries:
+        raise ConfigError("gnn dataset windows are empty.")
+    return entries
+
+
+def _integrate_window_matrix(
+    time_values: Sequence[float],
+    matrix: Sequence[Sequence[float]],
+    *,
+    start_idx: int,
+    end_idx: int,
+    use_abs: bool,
+) -> list[float]:
+    if end_idx <= start_idx:
+        return [0.0 for _ in matrix[0]]
+    start_idx = max(0, start_idx)
+    end_idx = min(len(time_values) - 1, end_idx)
+    values = matrix[start_idx : end_idx + 1]
+    times = time_values[start_idx : end_idx + 1]
+    if len(values) < 2 or len(times) < 2:
+        return [0.0 for _ in matrix[0]]
+    totals = [0.0 for _ in values[0]]
+    for idx in range(1, len(times)):
+        dt = times[idx] - times[idx - 1]
+        row = values[idx]
+        prev = values[idx - 1]
+        for col in range(len(totals)):
+            v0 = prev[col]
+            v1 = row[col]
+            if use_abs:
+                v0 = abs(v0)
+                v1 = abs(v1)
+            totals[col] += 0.5 * (v0 + v1) * dt
+    return totals
+
+
+def gnn_importance(
+    cfg: Mapping[str, Any],
+    *,
+    store: ArtifactStore,
+    registry: Optional[Registry] = None,
+) -> ArtifactCacheResult:
+    """Estimate reaction/species importance using temporal GNN inputs."""
+    if not isinstance(cfg, Mapping):
+        raise ConfigError("cfg must be a mapping.")
+
+    resolved_cfg = _resolve_cfg(cfg)
+    manifest_cfg, feat_cfg = _extract_features_cfg(resolved_cfg)
+    params = feat_cfg.get("params") or {}
+    if params is None:
+        params = {}
+    if not isinstance(params, Mapping):
+        raise ConfigError("params must be a mapping when provided.")
+    params = dict(params)
+    inputs = feat_cfg.get("inputs") or {}
+    if inputs is None:
+        inputs = {}
+    if not isinstance(inputs, Mapping):
+        raise ConfigError("inputs must be a mapping when provided.")
+
+    dataset_id = None
+    for key in ("dataset", "dataset_id", "gnn_dataset", "gnn_dataset_id"):
+        if key in inputs:
+            dataset_id = inputs.get(key)
+            break
+    if dataset_id is None:
+        for key in ("dataset", "dataset_id", "gnn_dataset", "gnn_dataset_id"):
+            if key in params:
+                dataset_id = params.get(key)
+                break
+    dataset_id = _require_nonempty_str(dataset_id, "gnn_dataset_id")
+
+    dataset_payload, dataset_dir = _load_gnn_dataset_payload(store, dataset_id)
+    items = _load_gnn_dataset_items(dataset_payload, dataset_dir=dataset_dir)
+    if not items:
+        raise ConfigError("gnn dataset contains no items.")
+
+    source_meta = dataset_payload.get("source") or {}
+    if source_meta is None:
+        source_meta = {}
+    if not isinstance(source_meta, Mapping):
+        raise ConfigError("gnn dataset source must be a mapping.")
+    graph_id = inputs.get("graph_id") or source_meta.get("graph_id")
+
+    run_set_id = inputs.get("run_set_id")
+    inputs_run_ids_raw = inputs.get("run_ids") or inputs.get("runs")
+    source_run_ids_raw = source_meta.get("run_ids") or source_meta.get("runs")
+    if run_set_id is not None and inputs_run_ids_raw is not None:
+        raise ConfigError("Specify only one of run_set_id or run_id(s) for gnn_importance.")
+    if run_set_id is not None:
+        run_set_id = _require_nonempty_str(run_set_id, "run_set_id")
+        run_ids = load_run_ids_from_run_set(store, run_set_id)
+    else:
+        run_ids = _coerce_str_sequence(inputs_run_ids_raw or source_run_ids_raw, "run_ids")
+        if not run_ids:
+            raise ConfigError("gnn_importance requires run_ids.")
+
+    windows = _extract_window_entries(dataset_payload)
+
+    gnn_cfg = params.get("gnn") or {}
+    if gnn_cfg is None:
+        gnn_cfg = {}
+    if not isinstance(gnn_cfg, Mapping):
+        raise ConfigError("gnn params must be a mapping.")
+    gnn_cfg = dict(gnn_cfg)
+
+    alpha = gnn_cfg.get("alpha", 0.6)
+    try:
+        alpha = float(alpha)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("gnn.alpha must be numeric.") from exc
+    steps = gnn_cfg.get("steps", 1)
+    if isinstance(steps, bool) or not isinstance(steps, int):
+        raise ConfigError("gnn.steps must be an integer.")
+    if steps < 0:
+        raise ConfigError("gnn.steps must be >= 0.")
+    normalize = gnn_cfg.get("normalize")
+    if normalize is None:
+        normalize = True
+    if not isinstance(normalize, bool):
+        raise ConfigError("gnn.normalize must be a boolean.")
+    undirected = gnn_cfg.get("undirected")
+    if undirected is None:
+        undirected = True
+    if not isinstance(undirected, bool):
+        raise ConfigError("gnn.undirected must be a boolean.")
+    feature_norm = _normalize_feature_norm(gnn_cfg.get("feature_norm"))
+
+    output_cfg = params.get("output") or {}
+    if output_cfg is None:
+        output_cfg = {}
+    if not isinstance(output_cfg, Mapping):
+        raise ConfigError("output params must be a mapping.")
+    output_cfg = dict(output_cfg)
+    reaction_feature = output_cfg.get("reaction_feature") or "gnn_reaction_importance"
+    species_feature = output_cfg.get("species_feature") or "gnn_species_importance"
+    include_reactions = output_cfg.get("include_reactions")
+    if include_reactions is None:
+        include_reactions = True
+    if not isinstance(include_reactions, bool):
+        raise ConfigError("output.include_reactions must be a boolean.")
+    include_species = output_cfg.get("include_species")
+    if include_species is None:
+        include_species = True
+    if not isinstance(include_species, bool):
+        raise ConfigError("output.include_species must be a boolean.")
+
+    rop_var = params.get("rop_var") or params.get("rop") or "rop_net"
+    if not isinstance(rop_var, str) or not rop_var.strip():
+        raise ConfigError("rop_var must be a non-empty string.")
+    rop_use_abs = params.get("rop_use_abs")
+    if rop_use_abs is None:
+        rop_use_abs = True
+    if not isinstance(rop_use_abs, bool):
+        raise ConfigError("rop_use_abs must be a boolean.")
+
+    node_meta = []
+    node_section = dataset_payload.get("nodes") or {}
+    if isinstance(node_section, Mapping):
+        node_meta = node_section.get("meta") or []
+    if not isinstance(node_meta, Sequence) or isinstance(
+        node_meta, (str, bytes, bytearray)
+    ):
+        node_meta = []
+    node_meta_list = [dict(entry) for entry in node_meta if isinstance(entry, Mapping)]
+    node_order = []
+    if isinstance(node_section, Mapping):
+        order = node_section.get("order")
+        if isinstance(order, Sequence) and not isinstance(
+            order, (str, bytes, bytearray)
+        ):
+            node_order = [str(name) for name in order]
+
+    rows: list[dict[str, Any]] = []
+
+    if include_species:
+        for item in items:
+            run_id = item.get("run_id") or item.get("case_id")
+            if run_id is None or not isinstance(run_id, str):
+                continue
+            if run_id not in run_ids:
+                run_ids.append(run_id)
+            window_id = item.get("window_id")
+            if window_id is None:
+                continue
+            try:
+                window_id = int(window_id)
+            except (TypeError, ValueError):
+                continue
+            features = item.get("x") or item.get("features")
+            if not isinstance(features, Sequence) or isinstance(
+                features, (str, bytes, bytearray)
+            ):
+                continue
+            base_scores = _gnn_base_scores(features, norm=feature_norm)
+            edge_index = item.get("edge_index") or []
+            edge_attr = item.get("edge_attr") or []
+            edges: list[tuple[int, int, float]] = []
+            if (
+                isinstance(edge_index, Sequence)
+                and len(edge_index) == 2
+                and isinstance(edge_index[0], Sequence)
+                and isinstance(edge_index[1], Sequence)
+            ):
+                rows_idx = list(edge_index[0])
+                cols_idx = list(edge_index[1])
+                for idx, (src, dst) in enumerate(zip(rows_idx, cols_idx)):
+                    try:
+                        weight = float(edge_attr[idx]) if idx < len(edge_attr) else 1.0
+                    except (TypeError, ValueError):
+                        weight = 1.0
+                    try:
+                        src_i = int(src)
+                        dst_i = int(dst)
+                    except (TypeError, ValueError):
+                        continue
+                    edges.append((src_i, dst_i, weight))
+            scores = _gnn_message_passing(
+                base_scores,
+                edges=edges,
+                steps=steps,
+                alpha=alpha,
+                normalize=normalize,
+                undirected=undirected,
+            )
+            window_info = item.get("window") or {}
+            if window_info is None:
+                window_info = {}
+            for idx, score in enumerate(scores):
+                meta = (
+                    node_meta_list[idx] if idx < len(node_meta_list) else {}
+                )
+                species = meta.get("species")
+                if species is None:
+                    continue
+                meta_payload = {
+                    "species": species,
+                    "species_index": meta.get("species_index"),
+                    "node_id": node_order[idx] if idx < len(node_order) else meta.get("id"),
+                    "window_id": window_id,
+                    "window": window_info,
+                    "case_id": run_id,
+                    "source": "gnn",
+                }
+                rows.append(
+                    _build_row(
+                        run_id,
+                        species_feature,
+                        float(score),
+                        "",
+                        meta_payload,
+                    )
+                )
+
+    run_ids = list(dict.fromkeys(run_ids))
+
+    if include_reactions:
+        for run_id in run_ids:
+            store.read_manifest("runs", run_id)
+            run_dir = store.artifact_dir("runs", run_id)
+            run_dataset = _load_run_dataset_view(run_dir)
+            time_values = _extract_time_values(run_dataset)
+            reaction_names = _extract_coord_data(run_dataset, "reaction")
+            if not isinstance(reaction_names, Sequence) or isinstance(
+                reaction_names, (str, bytes, bytearray)
+            ):
+                raise ConfigError("coords.reaction must be a sequence.")
+            reaction_names = [str(name) for name in reaction_names]
+            rop_payload = run_dataset.data_vars.get(rop_var)
+            if rop_payload is None:
+                raise ConfigError(f"Run dataset missing variable: {rop_var}")
+            matrix = _extract_time_matrix(
+                rop_payload,
+                time_values,
+                axis="reaction",
+                axis_names=reaction_names,
+            )
+            units = run_dataset.attrs.get("units", {})
+            if units is None:
+                units = {}
+            if not isinstance(units, Mapping):
+                raise ConfigError("attrs.units must be a mapping when provided.")
+            time_unit = units.get("time", "")
+            unit = _integral_unit(str(units.get(rop_var, "")), str(time_unit))
+            for window in windows:
+                values = _integrate_window_matrix(
+                    time_values,
+                    matrix,
+                    start_idx=window["start_idx"],
+                    end_idx=window["end_idx"],
+                    use_abs=rop_use_abs,
+                )
+                for r_idx, value in enumerate(values):
+                    meta_payload = {
+                        "reaction_id": reaction_names[r_idx],
+                        "reaction_index": r_idx,
+                        "window_id": window["window_id"],
+                        "window": window["window"],
+                        "case_id": run_id,
+                        "source": "rop",
+                    }
+                    rows.append(
+                        _build_row(
+                            run_id,
+                            reaction_feature,
+                            float(value),
+                            unit,
+                            meta_payload,
+                        )
+                    )
+
+    if not rows:
+        raise ConfigError("gnn_importance produced no feature rows.")
+
+    inputs_payload = {
+        "runs": run_ids,
+        "dataset_id": dataset_id,
+        "graph_id": graph_id,
+        "features": [reaction_feature, species_feature],
+        "gnn": {
+            "alpha": alpha,
+            "steps": steps,
+            "normalize": normalize,
+            "undirected": undirected,
+            "feature_norm": feature_norm,
+        },
+        "rop_var": rop_var,
+        "rop_use_abs": rop_use_abs,
+    }
+    artifact_id = make_artifact_id(
+        inputs=inputs_payload,
+        config=manifest_cfg,
+        code=_code_metadata(),
+        exclude_keys=("hydra",),
+    )
+    parents = list(dict.fromkeys(run_ids + [dataset_id]))
+    if graph_id:
+        parents.append(str(graph_id))
+    manifest = build_manifest(
+        kind="features",
+        artifact_id=artifact_id,
+        parents=parents,
+        inputs=inputs_payload,
+        config=manifest_cfg,
+    )
+
+    def _writer(base_dir: Path) -> None:
+        _write_features_table(rows, base_dir / "features.parquet")
+        summary = {
+            "rows": len(rows),
+            "run_ids": run_ids,
+            "dataset_id": dataset_id,
+            "graph_id": graph_id,
+            "features": [reaction_feature, species_feature],
+        }
+        write_json_atomic(base_dir / "importance_summary.json", summary)
+
+    return store.ensure(manifest, writer=_writer)
+
+
 def _prepare_network_params(
     params: Mapping[str, Any],
     *,
@@ -2482,7 +4927,28 @@ def run(
     resolved_cfg = _resolve_cfg(cfg)
     manifest_cfg, feat_cfg = _extract_features_cfg(resolved_cfg)
     params = _extract_params(feat_cfg)
-    run_ids = _extract_run_ids(feat_cfg)
+    run_ids = _extract_run_ids(feat_cfg, store=store)
+    inputs = feat_cfg.get("inputs")
+
+    graph_id_override: Optional[str] = None
+    if isinstance(inputs, Mapping):
+        raw_graph = None
+        for key in ("graph", "graphs", "graph_id", "graph_ids"):
+            if key in inputs:
+                raw_graph = inputs.get(key)
+                break
+        if raw_graph is not None:
+            if isinstance(raw_graph, str):
+                graph_id_override = _require_nonempty_str(raw_graph, "graph_id")
+            elif isinstance(raw_graph, Sequence) and not isinstance(
+                raw_graph, (str, bytes, bytearray)
+            ):
+                items = [item for item in raw_graph if item is not None]
+                if len(items) != 1:
+                    raise ConfigError("graph_id must include exactly one entry.")
+                graph_id_override = _require_nonempty_str(items[0], "graph_id")
+            else:
+                raise ConfigError("graph_id must be a string or single-item sequence.")
 
     features_raw = params.get("features", feat_cfg.get("features"))
     specs = _normalize_feature_specs(features_raw)
@@ -2501,6 +4967,8 @@ def run(
         for spec in specs:
             feature_params = dict(spec.params)
             if spec.name == "network_metrics":
+                if graph_id_override and "graph_id" not in feature_params:
+                    feature_params["graph_id"] = graph_id_override
                 feature_params = _prepare_network_params(
                     feature_params,
                     store=store,
@@ -2531,16 +4999,12 @@ def run(
         code=_code_metadata(),
         exclude_keys=("hydra",),
     )
-    manifest = ArtifactManifest(
-        schema_version=1,
+    manifest = build_manifest(
         kind="features",
-        id=artifact_id,
-        created_at=_utc_now_iso(),
+        artifact_id=artifact_id,
         parents=run_ids,
         inputs=inputs_payload,
         config=manifest_cfg,
-        code=_code_metadata(),
-        provenance=_provenance_metadata(),
     )
 
     def _writer(base_dir: Path) -> None:
@@ -2551,6 +5015,12 @@ def run(
 
 register("task", "features.run", run)
 register("task", "features.compute", run)
+register("task", "features.stable_projection", stable_projection_timeseries)
+register("task", "features.superstate_timeseries", superstate_timeseries)
+register("task", "features.superstate_qoi", superstate_qoi)
+register("task", "features.superstate_merge_quality", superstate_merge_quality)
+register("task", "features.reduction_cheap_metrics", reduction_cheap_metrics)
+register("task", "features.gnn_importance", gnn_importance)
 register("feature", "timeseries_summary", TimeseriesSummaryFeature())
 register("feature", "rop_wdot_summary", RopWdotFeature())
 register("feature", "network_metrics", NetworkMetricFeature())
@@ -2563,4 +5033,9 @@ __all__ = [
     "RopWdotFeature",
     "NetworkMetricFeature",
     "run",
+    "stable_projection_timeseries",
+    "superstate_timeseries",
+    "superstate_qoi",
+    "superstate_merge_quality",
+    "gnn_importance",
 ]

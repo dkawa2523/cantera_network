@@ -1,0 +1,30 @@
+name: build_gnn_dataset
+steps:
+  - id: sim
+    task: sim.run
+    sim: ${sim}
+  - id: graph
+    task: graphs.temporal_flux
+    inputs:
+      run_id: "@sim"
+    params:
+      windowing:
+        type: log_time
+        count: 3
+        base: 10.0
+      aggregation:
+        mix:
+          mean: 0.5
+          p95: 0.5
+      sparsify:
+        quantile: 0.9
+  - id: dataset
+    task: gnn_dataset.temporal_graph_pyg
+    inputs:
+      run_id: "@sim"
+      graph_id: "@graph"
+    params:
+      node_features: [X]
+      split:
+        train_ratio: 0.8
+        val_ratio: 0.2

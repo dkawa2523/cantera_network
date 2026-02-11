@@ -1,0 +1,18 @@
+# @package _global_
+defaults:
+  - override /sim: dummy
+  - override /pipeline: reduce_gnn_importance_prune
+  - _self_
+
+recipe:
+  name: reduce_gnn_importance_prune
+  description: GNN importance scoring with QoI-guided pruning.
+
+sim:
+  mechanism: configs/mechanism/dummy_minimal.yaml
+  reactions:
+    - R1
+    - R2
+  outputs:
+    include_rop: true
+    include_wdot: true

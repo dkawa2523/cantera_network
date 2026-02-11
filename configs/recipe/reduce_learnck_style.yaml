@@ -1,0 +1,12 @@
+# @package _global_
+defaults:
+  - override /sim: dummy
+  - override /pipeline: reduce_learnck_style
+  - _self_
+
+recipe:
+  name: reduce_learnck_style
+  description: LearnCK-style stable projection + overall reaction scaffold.
+
+sim:
+  mechanism: configs/mechanism/dummy_minimal.yaml

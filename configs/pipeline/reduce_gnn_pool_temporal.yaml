@@ -1,0 +1,63 @@
+name: reduce_gnn_pool_temporal
+steps:
+  - id: sim
+    task: sim.run
+    sim: ${sim}
+  - id: graph
+    task: graphs.temporal_flux
+    inputs:
+      run_id: "@sim"
+    params:
+      windowing:
+        type: log_time
+        count: 3
+        base: 10.0
+      aggregation:
+        mix:
+          mean: 0.5
+          p95: 0.5
+      sparsify:
+        quantile: 0.9
+  - id: dataset
+    task: gnn_dataset.temporal_graph_pyg
+    inputs:
+      run_id: "@sim"
+      graph_id: "@graph"
+    params:
+      node_features: [X]
+      split:
+        train_ratio: 0.8
+        val_ratio: 0.2
+  - id: mapping
+    task: reduction.gnn_pool_temporal
+    inputs:
+      graph_id: "@graph"
+      dataset_id: "@dataset"
+    params:
+      constraints:
+        fields: [phase, charge]
+      pool:
+        k_sweep: [4, 6, 8]
+        temperature: 1.0
+        max_iter: 25
+        symmetrize: true
+      temporal:
+        time_dim: 2
+        time_base: 10.0
+        message_passing: 1
+      selection:
+        coverage_slack: 0.02
+      window_split:
+        train_ratio: 0.8
+        val_ratio: 0.2
+        seed: ${common.seed}
+        shuffle: true
+  - id: superstate
+    task: features.superstate_timeseries
+    inputs:
+      run_id: "@sim"
+      mapping_id: "@mapping"
+    params:
+      x_var: X
+      wdot_var: net_production_rates
+      include_wdot: true

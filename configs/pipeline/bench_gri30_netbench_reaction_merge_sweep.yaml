@@ -1,0 +1,147 @@
+# NetBench: reaction merge sweep (reaction_lumping threshold) -> prune patch -> QoI validation -> viz
+steps:
+  - id: sim
+    task: sim.run_csv
+    sim: ${sim}
+    params:
+      conditions_file: ${benchmarks.conditions_file}
+      case_id: ${benchmarks.case_id}
+
+  - id: graph_mech
+    task: graphs.stoich
+    graphs:
+      mechanism: ${mechanism.path}
+    params: {}
+
+  - id: graph_flux
+    task: graphs.temporal_flux
+    inputs:
+      run_id: "@sim"
+      mechanism: ${mechanism.path}
+    params:
+      # Ensure cache refresh when temporal_flux_graph logic changes.
+      cache_bust: "2026-02-08"
+
+  # Higher threshold => fewer merges (more conservative).
+  - id: lump_t090
+    task: reduction.reaction_lumping
+    inputs: { graph_id: "@graph_mech" }
+    lumping: { method: threshold, threshold: 0.90, similarity: { metric: jaccard, mode: union, weights: { reactants: 0.5, products: 0.5 }, include_participants: false }, representative: { metric: degree } }
+  - id: red_t090
+    task: reduction.reaction_lumping_prune
+    inputs: { reaction_lumping: "@lump_t090" }
+    mechanism: ${mechanism.path}
+
+  - id: lump_t085
+    task: reduction.reaction_lumping
+    inputs: { graph_id: "@graph_mech" }
+    lumping: { method: threshold, threshold: 0.85, similarity: { metric: jaccard, mode: union, weights: { reactants: 0.5, products: 0.5 }, include_participants: false }, representative: { metric: degree } }
+  - id: red_t085
+    task: reduction.reaction_lumping_prune
+    inputs: { reaction_lumping: "@lump_t085" }
+    mechanism: ${mechanism.path}
+
+  - id: lump_t080
+    task: reduction.reaction_lumping
+    inputs: { graph_id: "@graph_mech" }
+    lumping: { method: threshold, threshold: 0.80, similarity: { metric: jaccard, mode: union, weights: { reactants: 0.5, products: 0.5 }, include_participants: false }, representative: { metric: degree } }
+  - id: red_t080
+    task: reduction.reaction_lumping_prune
+    inputs: { reaction_lumping: "@lump_t080" }
+    mechanism: ${mechanism.path}
+
+  - id: lump_t075
+    task: reduction.reaction_lumping
+    inputs: { graph_id: "@graph_mech" }
+    lumping: { method: threshold, threshold: 0.75, similarity: { metric: jaccard, mode: union, weights: { reactants: 0.5, products: 0.5 }, include_participants: false }, representative: { metric: degree } }
+  - id: red_t075
+    task: reduction.reaction_lumping_prune
+    inputs: { reaction_lumping: "@lump_t075" }
+    mechanism: ${mechanism.path}
+
+  - id: lump_t070
+    task: reduction.reaction_lumping
+    inputs: { graph_id: "@graph_mech" }
+    lumping: { method: threshold, threshold: 0.70, similarity: { metric: jaccard, mode: union, weights: { reactants: 0.5, products: 0.5 }, include_participants: false }, representative: { metric: degree } }
+  - id: red_t070
+    task: reduction.reaction_lumping_prune
+    inputs: { reaction_lumping: "@lump_t070" }
+    mechanism: ${mechanism.path}
+
+  - id: lump_t065
+    task: reduction.reaction_lumping
+    inputs: { graph_id: "@graph_mech" }
+    lumping: { method: threshold, threshold: 0.65, similarity: { metric: jaccard, mode: union, weights: { reactants: 0.5, products: 0.5 }, include_participants: false }, representative: { metric: degree } }
+  - id: red_t065
+    task: reduction.reaction_lumping_prune
+    inputs: { reaction_lumping: "@lump_t065" }
+    mechanism: ${mechanism.path}
+
+  - id: lump_t060
+    task: reduction.reaction_lumping
+    inputs: { graph_id: "@graph_mech" }
+    lumping: { method: threshold, threshold: 0.60, similarity: { metric: jaccard, mode: union, weights: { reactants: 0.5, products: 0.5 }, include_participants: false }, representative: { metric: degree } }
+  - id: red_t060
+    task: reduction.reaction_lumping_prune
+    inputs: { reaction_lumping: "@lump_t060" }
+    mechanism: ${mechanism.path}
+
+  - id: val
+    task: reduction.validate
+    inputs:
+      patches:
+        - "@red_t090"
+        - "@red_t085"
+        - "@red_t080"
+        - "@red_t075"
+        - "@red_t070"
+        - "@red_t065"
+        - "@red_t060"
+    mechanism: ${mechanism.path}
+    validation:
+      pipeline: bench_gri30_netbench_validation
+      case_mode: all
+      conditions_file: ${oc.select:benchmarks.validation_conditions_file,benchmarks/assets/conditions/gri30_netbench_val.csv}
+      metric: rel
+      tolerance: 0.5
+      stop_on_fail: false
+      use_multipliers_only: true
+      sim_step_id: sim
+      observables_step_id: observables
+      features_step_id: features
+
+  - id: viz
+    task: viz.benchmark_report
+    name: bench_gri30_netbench_reaction_merge_sweep
+    dashboard: benchmark
+    chart_backend: svg
+    export_images:
+      enabled: true
+      formats: [svg]
+      dir: images
+    inputs:
+      runs: "@sim"
+      graphs: ["@graph_mech", "@graph_flux"]
+      reduction:
+        - "@red_t090"
+        - "@red_t085"
+        - "@red_t080"
+        - "@red_t075"
+        - "@red_t070"
+        - "@red_t065"
+        - "@red_t060"
+      validation: ["@val"]
+    graphviz:
+      top_n: 8
+      max_nodes: 80
+      max_edges: 160
+      engine_bipartite: dot
+      engine_flux: sfdp
+      export_dot: true
+      export_svg: true
+      emit_all_patches: true
+      plots: [top_rop, top_wdot, patch, top_rop_reduced, flux_species]
+    reduction_effect:
+      top_n: 12
+    params: {}
+

@@ -12,6 +12,7 @@ from typing import Any, Optional, Union
 
 from rxn_platform.core import ArtifactManifest, dump_manifest, load_manifest
 from rxn_platform.errors import ArtifactError
+from rxn_platform.run_store import normalize_component
 
 _Payload = Union[str, bytes, bytearray, Path]
 
@@ -108,8 +109,8 @@ class ArtifactStore:
         self.root = Path(root)
 
     def artifact_dir(self, kind: str, artifact_id: str) -> Path:
-        kind = self._validate_component("kind", kind)
-        artifact_id = self._validate_component("artifact_id", artifact_id)
+        kind = normalize_component(kind, "kind")
+        artifact_id = normalize_component(artifact_id, "artifact_id")
         return self.root / kind / artifact_id
 
     def manifest_path(self, kind: str, artifact_id: str) -> Path:
@@ -137,8 +138,8 @@ class ArtifactStore:
         """Return the cached artifact, or create it if missing."""
         if not hasattr(manifest, "to_dict"):
             raise TypeError("manifest must be an ArtifactManifest instance.")
-        kind = self._validate_component("kind", manifest.kind)
-        artifact_id = self._validate_component("artifact_id", manifest.id)
+        kind = normalize_component(manifest.kind, "kind")
+        artifact_id = normalize_component(manifest.id, "artifact_id")
         target_dir = self.artifact_dir(kind, artifact_id)
         if self.exists(kind, artifact_id):
             existing = self.open_manifest(kind, artifact_id)
@@ -173,8 +174,8 @@ class ArtifactStore:
     ) -> Path:
         if not hasattr(manifest, "to_dict"):
             raise TypeError("manifest must be an ArtifactManifest instance.")
-        kind = self._validate_component("kind", manifest.kind)
-        artifact_id = self._validate_component("artifact_id", manifest.id)
+        kind = normalize_component(manifest.kind, "kind")
+        artifact_id = normalize_component(manifest.id, "artifact_id")
         target_dir = self.artifact_dir(kind, artifact_id)
         if target_dir.exists():
             raise FileExistsError(f"Artifact already exists: {target_dir}")
@@ -233,16 +234,6 @@ class ArtifactStore:
             target.write_text(payload, encoding="utf-8")
             return
         raise TypeError(f"Unsupported payload type for {name}: {type(payload)!r}")
-
-    def _validate_component(self, label: str, value: str) -> str:
-        if not isinstance(value, str) or not value.strip():
-            raise TypeError(f"{label} must be a non-empty string.")
-        path = Path(value)
-        if path.is_absolute() or ".." in path.parts or len(path.parts) != 1:
-            raise ValueError(f"{label} must be a single path component: {value!r}")
-        if value in {".", ".."}:
-            raise ValueError(f"{label} must not be '.' or '..'.")
-        return value
 
     def _safe_relative_path(self, name: str) -> Path:
         path = Path(name)

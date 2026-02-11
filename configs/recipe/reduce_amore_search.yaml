@@ -1,0 +1,18 @@
+# @package _global_
+defaults:
+  - override /sim: dummy
+  - override /pipeline: reduce_amore_search
+  - _self_
+
+recipe:
+  name: reduce_amore_search
+  description: Beam search reduction with cheap temporal flux screening.
+
+sim:
+  mechanism: configs/mechanism/dummy_minimal.yaml
+  reactions:
+    - R1
+    - R2
+  outputs:
+    include_rop: true
+    include_wdot: true

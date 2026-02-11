@@ -28,3 +28,29 @@
 - カテゴリ間の接続は Artifact のみ（直接関数呼び出しをしない）。
 - 便利関数を増やす前に、Artifact 契約や Task API の見直しで吸収できないか検討する。
 - 新しい Artifact 種別や必須フィールドを追加した場合は、`docs/02_ARTIFACT_CONTRACTS.md` と validator/テストも更新する。
+
+## 7. 縮退法（reducer）追加手順（Plugin registry 前提）
+- 既存の `src/rxn_platform/tasks/reduction.py` に実装を追加する（ファイル増殖を避ける）。
+- 関数は `cfg`（または `config`）を受け取り、`ArtifactCacheResult` を返す。
+- 生成物は `docs/02_ARTIFACT_CONTRACTS.md` に沿って `reduction/<id>/` 配下へ保存する。
+- Plugin registry に登録する:
+  - `register("task", "reduction.<your_name>", <your_function>)`
+  - `__all__` に追加して公開する。
+- 入口は `reduction.dispatch` を使い、`method=<your_name>` で選択する（if/else増殖禁止）。
+- 必要に応じて pipeline を追加する:
+  - `configs/pipeline/reduce_<your_name>.yaml` を作成し `task: reduction.dispatch` と `method: <your_name>` を使う。
+  - 入口が必要なら `configs/recipe/reduce_<your_name>.yaml` も用意する（recipe は短く）。
+- 新規ファイルを作る場合は `src/rxn_platform/tasks/runner.py` の `_load_builtin_plugins()` に import を追加する。
+- 追加した縮退法の smoke / regression テストを `tests/` に足す（重要度に応じて）。
+- `benchmark_compare` は registry に登録された `reduction.*` タスクから reducer を推定する。
+
+## 8. Lint / format / type / pre-commit
+- 開発用依存（オフライン環境は社内ミラー/ローカル wheel を使用）:
+  - `python -m pip install -e ".[dev]"`（TODO: オフライン手順を追記）
+- Lint / format / type:
+  - `ruff check .`
+  - `black --check .`
+  - `mypy`
+- pre-commit（ローカル hook / ネットワーク不要）:
+  - `pre-commit install`
+  - `pre-commit run --all-files`

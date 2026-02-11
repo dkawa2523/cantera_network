@@ -3,29 +3,31 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import csv
 from dataclasses import dataclass
-from datetime import datetime, timezone
 import json
 import logging
 import math
-import platform
 from pathlib import Path
-import subprocess
 from typing import Any, Optional
-
-from rxn_platform import __version__
 from rxn_platform.core import (
-    ArtifactManifest,
     make_artifact_id,
     make_run_id,
     normalize_reaction_multipliers,
+    resolve_repo_path,
 )
 from rxn_platform.errors import ConfigError
-from rxn_platform.hydra_utils import resolve_config
+from rxn_platform.io_utils import write_json_atomic
 from rxn_platform.pipelines import PipelineRunner
 from rxn_platform.registry import Registry, register
 from rxn_platform.store import ArtifactCacheResult, ArtifactStore
 from rxn_platform.tasks.base import Task
+from rxn_platform.tasks.common import (
+    build_manifest,
+    code_metadata as _code_metadata,
+    read_table_rows as _read_table_rows,
+    resolve_cfg as _resolve_cfg,
+)
 
 try:  # Optional dependency.
     import pandas as pd
@@ -67,21 +69,6 @@ class ReactionSpec:
 class ConditionSpec:
     sim_cfg: dict[str, Any]
     condition_id: Optional[str]
-
-
-def _utc_now_iso() -> str:
-    timestamp = datetime.now(timezone.utc).replace(microsecond=0)
-    return timestamp.isoformat().replace("+00:00", "Z")
-
-
-def _resolve_cfg(cfg: Any) -> dict[str, Any]:
-    try:
-        resolved = resolve_config(cfg)
-    except ConfigError:
-        if isinstance(cfg, Mapping):
-            return dict(cfg)
-        raise
-    return resolved
 
 
 def _extract_sensitivity_cfg(
@@ -218,6 +205,225 @@ def _normalize_conditions(value: Any) -> list[ConditionSpec]:
     return specs
 
 
+def _load_csv_rows(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        raise ConfigError(f"conditions_file not found: {path}")
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        rows = [dict(row) for row in reader]
+    if not rows:
+        raise ConfigError(f"conditions_file is empty: {path}")
+    return rows
+
+
+def _coerce_optional_float(value: Any, label: str) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    if isinstance(value, bool):
+        raise ConfigError(f"{label} must be numeric.")
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{label} must be numeric.") from exc
+
+
+def _apply_csv_condition(
+    sim_cfg: Mapping[str, Any],
+    *,
+    temperature: Optional[float],
+    pressure_atm: Optional[float],
+    phi: Optional[float],
+    t_end: Optional[float],
+    case_id: Optional[str],
+) -> dict[str, Any]:
+    updated = dict(sim_cfg)
+    initial = dict(updated.get("initial", {}))
+    if temperature is not None:
+        initial["T"] = temperature
+    if pressure_atm is not None:
+        initial["P"] = pressure_atm * 101325.0
+    if phi is not None:
+        if phi <= 0.0:
+            raise ConfigError("phi must be positive.")
+        composition = dict(initial.get("X") or {})
+        composition["CH4"] = 1.0
+        composition["O2"] = 2.0 / float(phi)
+        composition["N2"] = composition["O2"] * 3.76
+        initial["X"] = composition
+    if initial:
+        updated["initial"] = initial
+
+    if t_end is not None:
+        if "time_grid" in updated and isinstance(updated.get("time_grid"), Mapping):
+            time_grid = dict(updated.get("time_grid") or {})
+            time_grid["stop"] = t_end
+            updated["time_grid"] = time_grid
+        elif "time" in updated and isinstance(updated.get("time"), Mapping):
+            time_cfg = dict(updated.get("time") or {})
+            time_cfg["stop"] = t_end
+            updated["time"] = time_cfg
+        else:
+            updated["time_grid"] = {"start": 0.0, "stop": t_end, "steps": 4}
+    if case_id:
+        updated["condition_id"] = case_id
+    return updated
+
+
+def _coerce_case_ids(value: Any) -> Optional[list[str]]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            raise ConfigError("case_id must be a non-empty string.")
+        return [value]
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        items: list[str] = []
+        for entry in value:
+            if not isinstance(entry, str) or not entry.strip():
+                raise ConfigError("case_id entries must be non-empty strings.")
+            items.append(entry.strip())
+        return items
+    raise ConfigError("case_id must be a string or list of strings.")
+
+
+def _coerce_row_indices(value: Any) -> Optional[list[int]]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ConfigError("row_index must be an integer.")
+    if isinstance(value, int):
+        return [value]
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        indices: list[int] = []
+        for entry in value:
+            if isinstance(entry, bool):
+                raise ConfigError("row_index entries must be integers.")
+            try:
+                indices.append(int(entry))
+            except (TypeError, ValueError) as exc:
+                raise ConfigError("row_index entries must be integers.") from exc
+        return indices
+    raise ConfigError("row_index must be an integer or list of integers.")
+
+
+def _extract_conditions_file_settings(
+    cfg: Mapping[str, Any],
+    sens_cfg: Mapping[str, Any],
+    params: Mapping[str, Any],
+) -> tuple[Path, Optional[list[str]], Optional[list[int]], str]:
+    sources: list[Mapping[str, Any]] = []
+    for source in (params, sens_cfg, cfg):
+        if isinstance(source, Mapping):
+            sources.append(source)
+        benchmarks = source.get("benchmarks") if isinstance(source, Mapping) else None
+        if isinstance(benchmarks, Mapping):
+            sources.append(benchmarks)
+
+    conditions_file: Optional[Any] = None
+    for source in sources:
+        for key in ("conditions_file", "conditions_path", "conditions_csv", "csv"):
+            if key in source:
+                conditions_file = source.get(key)
+                break
+        if conditions_file is not None:
+            break
+    if conditions_file is None:
+        raise ConfigError("conditions_file is required for sensitivity conditions_file.")
+    if not isinstance(conditions_file, (str, Path)) or not str(conditions_file).strip():
+        raise ConfigError("conditions_file must be a non-empty string or Path.")
+    conditions_path = resolve_repo_path(conditions_file)
+
+    case_ids: Optional[list[str]] = None
+    row_indices: Optional[list[int]] = None
+    case_col: Optional[str] = None
+    for source in sources:
+        if case_ids is None:
+            for key in ("case_ids", "case_id", "condition_id"):
+                if key in source and source.get(key) is not None:
+                    case_ids = _coerce_case_ids(source.get(key))
+                    break
+        if row_indices is None and "row_index" in source:
+            row_indices = _coerce_row_indices(source.get("row_index"))
+        if case_col is None:
+            for key in ("case_column", "case_col", "case_field"):
+                if key in source and source.get(key) is not None:
+                    case_col = source.get(key)
+                    break
+        if case_ids is not None and row_indices is not None and case_col is not None:
+            break
+    if case_col is None:
+        case_col = "case_id"
+    if not isinstance(case_col, str) or not case_col.strip():
+        raise ConfigError("case_column must be a non-empty string.")
+    case_col = case_col.strip()
+
+    return conditions_path, case_ids, row_indices, case_col
+
+
+def _build_condition_specs_from_csv(
+    sim_cfg: Mapping[str, Any],
+    *,
+    conditions_path: Path,
+    case_ids: Optional[list[str]],
+    row_indices: Optional[list[int]],
+    case_col: str,
+) -> list[ConditionSpec]:
+    rows = _load_csv_rows(conditions_path)
+    selected: list[dict[str, str]] = []
+    if case_ids:
+        for row in rows:
+            if row.get(case_col) in case_ids:
+                selected.append(row)
+        if not selected:
+            raise ConfigError("No matching case_id found in conditions file.")
+    elif row_indices:
+        for idx in row_indices:
+            if idx < 0 or idx >= len(rows):
+                raise ConfigError("row_index out of range for conditions file.")
+            selected.append(rows[idx])
+    else:
+        selected = rows
+
+    specs: list[ConditionSpec] = []
+    for row in selected:
+        def _pick(keys: Sequence[str]) -> Optional[str]:
+            for key in keys:
+                if key in row and row.get(key) is not None:
+                    value = row.get(key)
+                    if isinstance(value, str) and not value.strip():
+                        return None
+                    return value
+            return None
+
+        temperature = _coerce_optional_float(
+            _pick(("T0", "T", "temperature")), "temperature"
+        )
+        pressure_atm = _coerce_optional_float(
+            _pick(("P0_atm", "P_atm", "P0", "pressure_atm", "pressure")),
+            "pressure_atm",
+        )
+        phi = _coerce_optional_float(_pick(("phi",)), "phi")
+        t_end = _coerce_optional_float(_pick(("t_end", "t_end_s", "t_end_seconds")), "t_end")
+        row_case_id = row.get(case_col) if case_col in row else None
+        if isinstance(row_case_id, str) and not row_case_id.strip():
+            row_case_id = None
+
+        updated = _apply_csv_condition(
+            sim_cfg,
+            temperature=temperature,
+            pressure_atm=pressure_atm,
+            phi=phi,
+            t_end=t_end,
+            case_id=row_case_id,
+        )
+        specs.append(ConditionSpec(sim_cfg=updated, condition_id=row_case_id))
+    if not specs:
+        raise ConfigError("No conditions resolved for sensitivity computation.")
+    return specs
+
 def _normalize_sim_cfgs(value: Any) -> list[ConditionSpec]:
     if isinstance(value, Mapping):
         sim_cfg = dict(value)
@@ -255,6 +461,42 @@ def _extract_sim_cfgs(
             break
     if conditions is not None:
         return _normalize_conditions(conditions)
+
+    conditions_file_present = False
+    for source in (params, sens_cfg, cfg):
+        if not isinstance(source, Mapping):
+            continue
+        if "conditions_file" in source or "conditions_path" in source or "conditions_csv" in source:
+            conditions_file_present = True
+            break
+        benchmarks = source.get("benchmarks")
+        if isinstance(benchmarks, Mapping) and "conditions_file" in benchmarks:
+            conditions_file_present = True
+            break
+    if conditions_file_present:
+        sim_cfg: Any = None
+        for source in (sens_cfg, params, cfg):
+            if isinstance(source, Mapping) and "sim" in source:
+                sim_cfg = source.get("sim")
+                break
+        if sim_cfg is None:
+            inputs = sens_cfg.get("inputs")
+            if isinstance(inputs, Mapping) and "sim" in inputs:
+                sim_cfg = inputs.get("sim")
+        if not isinstance(sim_cfg, Mapping):
+            raise ConfigError("sim config mapping is required with conditions_file.")
+        conditions_path, case_ids, row_indices, case_col = _extract_conditions_file_settings(
+            cfg,
+            sens_cfg,
+            params,
+        )
+        return _build_condition_specs_from_csv(
+            dict(sim_cfg),
+            conditions_path=conditions_path,
+            case_ids=case_ids,
+            row_indices=row_indices,
+            case_col=case_col,
+        )
 
     sim_cfg: Any = None
     for source in (sens_cfg, params, cfg):
@@ -508,61 +750,16 @@ def _write_sensitivity_table(rows: Sequence[Mapping[str, Any]], path: Path) -> N
         pq.write_table(table, path)
         return
     payload = {"columns": columns, "rows": list(rows)}
-    payload_text = json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n"
-    path.write_text(payload_text, encoding="utf-8")
+    write_json_atomic(path, payload)
     json_path = path.with_suffix(".json")
     if json_path != path:
-        json_path.write_text(payload_text, encoding="utf-8")
+        write_json_atomic(json_path, payload)
     logger = logging.getLogger("rxn_platform.sensitivity")
     logger.warning(
         "Parquet writer unavailable; stored JSON payload at %s and %s.",
         path,
         json_path,
     )
-
-
-def _read_table_rows(path: Path) -> list[dict[str, Any]]:
-    if pd is not None:
-        try:
-            frame = pd.read_parquet(path)
-            return frame.to_dict(orient="records")
-        except Exception:
-            pass
-    if pq is not None:
-        try:
-            table = pq.read_table(path)
-            return table.to_pylist()
-        except Exception:
-            pass
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    return list(payload.get("rows", []))
-
-
-def _code_metadata() -> dict[str, Any]:
-    payload: dict[str, Any] = {"version": __version__}
-    git_dir = Path.cwd() / ".git"
-    if not git_dir.exists():
-        return payload
-    try:
-        commit = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
-        payload["git_commit"] = commit
-        dirty = subprocess.check_output(
-            ["git", "status", "--porcelain"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
-        payload["dirty"] = bool(dirty)
-    except (OSError, subprocess.SubprocessError):
-        return payload
-    return payload
-
-
-def _provenance_metadata() -> dict[str, Any]:
-    return {"python": platform.python_version()}
 
 
 def _multiplier_sort_key(entry: Mapping[str, Any]) -> tuple[int, Any]:
@@ -1175,16 +1372,12 @@ def run(
     parents = _dedupe_preserve(
         baseline_run_ids + perturbed_run_ids + baseline_obs_ids + perturbed_obs_ids
     )
-    manifest = ArtifactManifest(
-        schema_version=1,
+    manifest = build_manifest(
         kind="sensitivity",
-        id=artifact_id,
-        created_at=_utc_now_iso(),
+        artifact_id=artifact_id,
         parents=parents,
         inputs=inputs_payload,
         config=manifest_cfg,
-        code=_code_metadata(),
-        provenance=_provenance_metadata(),
     )
 
     def _writer(base_dir: Path) -> None:

@@ -4,22 +4,25 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
 import json
 import logging
 import math
-import platform
 from pathlib import Path
 import re
-import subprocess
 from typing import Any, Optional
-
-from rxn_platform import __version__
-from rxn_platform.core import ArtifactManifest, make_artifact_id
+from rxn_platform.core import make_artifact_id
 from rxn_platform.errors import ArtifactError, ConfigError
-from rxn_platform.hydra_utils import resolve_config
+from rxn_platform.io_utils import write_json_atomic
 from rxn_platform.registry import Registry, register
+from rxn_platform.run_store import resolve_run_dataset_dir
 from rxn_platform.store import ArtifactCacheResult, ArtifactStore
+from rxn_platform.tasks.common import (
+    build_manifest,
+    code_metadata as _code_metadata,
+    load_run_dataset_payload,
+    load_run_ids_from_run_set,
+    resolve_cfg as _resolve_cfg,
+)
 
 try:  # Optional dependency.
     import pandas as pd
@@ -203,6 +206,82 @@ class GasCompositionObservable(Observable):
             )
 
         return rows
+
+
+class IgnitionDelayObservable(Observable):
+    """Compute ignition delay as the time of maximum dT/dt.
+
+    This matches the definition used in benchmarks/scripts/netbench_generate_obs_cantera.py
+    (finite difference vs previous point; take the timestamp of the max slope).
+    """
+
+    name = "ignition_delay"
+    requires = ("T",)
+    requires_coords = ("time",)
+
+    def compute(
+        self,
+        run_dataset: RunDatasetView,
+        cfg: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if not isinstance(cfg, Mapping):
+            raise ConfigError("ignition_delay params must be a mapping.")
+
+        time_values = _coerce_float_sequence(
+            _extract_coord_data(run_dataset, "time"),
+            "coords.time",
+        )
+
+        t_payload = run_dataset.data_vars.get("T")
+        if not isinstance(t_payload, Mapping):
+            raise ConfigError("data_vars.T must be a mapping.")
+        dims = t_payload.get("dims")
+        data = t_payload.get("data")
+        if isinstance(dims, str) or not isinstance(dims, Sequence):
+            raise ConfigError("data_vars.T.dims must be a sequence.")
+        dims_list = list(dims)
+        if dims_list != ["time"]:
+            raise ConfigError("data_vars.T.dims must be ['time'].")
+        temperatures = _coerce_float_sequence(data, "data_vars.T.data")
+        if len(temperatures) != len(time_values):
+            raise ConfigError("T series length must match time coordinates.")
+
+        time_unit = ""
+        units = run_dataset.attrs.get("units")
+        if units is not None:
+            if not isinstance(units, Mapping):
+                raise ConfigError("attrs.units must be a mapping when provided.")
+            raw_time = units.get("time")
+            if raw_time is not None:
+                time_unit = str(raw_time)
+
+        if len(time_values) < 2:
+            return {
+                "observable": "ignition_delay",
+                "value": math.nan,
+                "unit": time_unit,
+                "meta": {"status": "insufficient_points", "n": len(time_values)},
+            }
+
+        best_idx = 1
+        best_value = -math.inf
+        for idx in range(1, len(time_values)):
+            dt = float(time_values[idx]) - float(time_values[idx - 1])
+            if dt <= 0.0:
+                dt = 1.0e-12
+            dTdt = (float(temperatures[idx]) - float(temperatures[idx - 1])) / dt
+            if dTdt > best_value:
+                best_value = dTdt
+                best_idx = idx
+
+        return {
+            "observable": "ignition_delay",
+            "value": float(time_values[best_idx]),
+            "unit": time_unit,
+            # Keep meta stable across baseline/reduced runs so validation can
+            # compare values without mismatching on debug-only fields.
+            "meta": {"method": "max_dTdt_prev_point"},
+        }
 
 
 class CoverageObservable(Observable):
@@ -951,21 +1030,6 @@ def _build_element_rows(
     return rows
 
 
-def _utc_now_iso() -> str:
-    timestamp = datetime.now(timezone.utc).replace(microsecond=0)
-    return timestamp.isoformat().replace("+00:00", "Z")
-
-
-def _resolve_cfg(cfg: Any) -> dict[str, Any]:
-    try:
-        resolved = resolve_config(cfg)
-    except ConfigError:
-        if isinstance(cfg, Mapping):
-            return dict(cfg)
-        raise
-    return resolved
-
-
 def _extract_observables_cfg(cfg: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     if "observables" in cfg and isinstance(cfg.get("observables"), Mapping):
         obs_cfg = cfg.get("observables")
@@ -1018,18 +1082,36 @@ def _coerce_run_ids(value: Any) -> list[str]:
     raise ConfigError("run_id(s) must be a string or sequence of strings.")
 
 
-def _extract_run_ids(obs_cfg: Mapping[str, Any]) -> list[str]:
+def _extract_run_ids(
+    obs_cfg: Mapping[str, Any],
+    *,
+    store: Optional[ArtifactStore] = None,
+) -> list[str]:
     inputs = obs_cfg.get("inputs")
+    run_set_id: Any = None
     run_ids: Any = None
     if inputs is None:
         run_ids = None
     elif not isinstance(inputs, Mapping):
         raise ConfigError("observables.inputs must be a mapping.")
     else:
+        if "run_set_id" in inputs:
+            run_set_id = inputs.get("run_set_id")
         for key in ("runs", "run_ids", "run_id", "run"):
             if key in inputs:
                 run_ids = inputs.get(key)
                 break
+        if run_set_id is not None and run_ids is not None:
+            raise ConfigError("Specify only one of run_set_id or run_id(s).")
+    if run_set_id is None and "run_set_id" in obs_cfg:
+        run_set_id = obs_cfg.get("run_set_id")
+        if run_set_id is not None and run_ids is not None:
+            raise ConfigError("Specify only one of run_set_id or run_id(s).")
+    if run_set_id is not None:
+        run_set_id = _require_nonempty_str(run_set_id, "run_set_id")
+        if store is None:
+            raise ConfigError("run_set_id requires a store to be provided.")
+        return load_run_ids_from_run_set(store, run_set_id)
     if run_ids is None:
         for key in ("runs", "run_ids", "run_id", "run"):
             if key in obs_cfg:
@@ -1120,48 +1202,20 @@ def _normalize_missing_strategy(value: Any) -> str:
     return strategy
 
 
-def _code_metadata() -> dict[str, Any]:
-    payload: dict[str, Any] = {"version": __version__}
-    git_dir = Path.cwd() / ".git"
-    if not git_dir.exists():
-        return payload
-    try:
-        commit = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
-        payload["git_commit"] = commit
-        dirty = subprocess.check_output(
-            ["git", "status", "--porcelain"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
-        payload["dirty"] = bool(dirty)
-    except (OSError, subprocess.SubprocessError):
-        return payload
-    return payload
-
-
-def _provenance_metadata() -> dict[str, Any]:
-    return {"python": platform.python_version()}
-
-
 def _load_run_dataset_payload(run_dir: Path) -> dict[str, Any]:
-    dataset_path = run_dir / "state.zarr" / "dataset.json"
+    dataset_dir = resolve_run_dataset_dir(run_dir)
+    if dataset_dir is None:
+        raise ArtifactError(
+            "Run dataset not found; expected sim/timeseries.zarr or state.zarr."
+        )
+    dataset_path = dataset_dir / "dataset.json"
     if dataset_path.exists():
-        try:
-            payload = json.loads(dataset_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise ArtifactError(f"Run dataset JSON is invalid: {exc}") from exc
-        if not isinstance(payload, Mapping):
-            raise ArtifactError("Run dataset JSON must be a mapping.")
-        return dict(payload)
+        return load_run_dataset_payload(run_dir, dataset_dir=dataset_dir)
     if xr is None:
         raise ArtifactError(
-            "Run dataset not found; install xarray to load state.zarr."
+            "Run dataset not found; install xarray to load timeseries.zarr."
         )
-    dataset = xr.open_zarr(run_dir / "state.zarr")
+    dataset = xr.open_zarr(dataset_dir)
     coords = _LazyDatasetMapping(dataset, "coords")
     data_vars = _LazyDatasetMapping(dataset, "data_vars")
     return {"coords": coords, "data_vars": data_vars, "attrs": dict(dataset.attrs)}
@@ -1458,11 +1512,10 @@ def _write_values_table(rows: Sequence[Mapping[str, Any]], path: Path) -> None:
         "columns": list(REQUIRED_COLUMNS),
         "rows": list(rows),
     }
-    payload_text = json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n"
-    path.write_text(payload_text, encoding="utf-8")
+    write_json_atomic(path, payload)
     json_path = path.with_suffix(".json")
     if json_path != path:
-        json_path.write_text(payload_text, encoding="utf-8")
+        write_json_atomic(json_path, payload)
     logger = logging.getLogger("rxn_platform.observables")
     logger.warning(
         "Parquet writer unavailable; stored JSON payload at %s and %s.",
@@ -1484,7 +1537,7 @@ def run(
     resolved_cfg = _resolve_cfg(cfg)
     manifest_cfg, obs_cfg = _extract_observables_cfg(resolved_cfg)
     params = _extract_params(obs_cfg)
-    run_ids = _extract_run_ids(obs_cfg)
+    run_ids = _extract_run_ids(obs_cfg, store=store)
 
     observables_raw = params.get("observables", obs_cfg.get("observables"))
     specs = _normalize_observable_specs(observables_raw)
@@ -1528,16 +1581,12 @@ def run(
         code=_code_metadata(),
         exclude_keys=("hydra",),
     )
-    manifest = ArtifactManifest(
-        schema_version=1,
+    manifest = build_manifest(
         kind="observables",
-        id=artifact_id,
-        created_at=_utc_now_iso(),
+        artifact_id=artifact_id,
         parents=run_ids,
         inputs=inputs_payload,
         config=manifest_cfg,
-        code=_code_metadata(),
-        provenance=_provenance_metadata(),
     )
 
     def _writer(base_dir: Path) -> None:
@@ -1549,12 +1598,14 @@ def run(
 register("task", "observables.run", run)
 register("task", "observables.compute", run)
 register("observable", "gas_composition", GasCompositionObservable())
+register("observable", "ignition_delay", IgnitionDelayObservable())
 register("observable", "coverage_summary", CoverageObservable())
 register("observable", "film_thickness", FilmThicknessObservable())
 
 __all__ = [
     "FilmThicknessObservable",
     "GasCompositionObservable",
+    "IgnitionDelayObservable",
     "CoverageObservable",
     "Observable",
     "ObservableSpec",

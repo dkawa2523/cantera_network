@@ -1,0 +1,27 @@
+steps:
+  - id: sim
+    task: sim.sweep_csv
+    inputs: {}
+    params:
+      mechanism_path: ${mechanism.path}
+      conditions_file: ${benchmarks.conditions_file}
+      model: gri30
+  - id: obs
+    task: observables.compute
+    inputs: { runs: "@sim" }
+    params:
+      observables: [gas_composition, temperature_summary]
+  - id: assim
+    task: assimilation.eki
+    inputs: { runs: "@sim", observables: "@obs" }
+    params:
+      obs_file: ${assimilation.obs_file}
+      param_mode: "multiplier_topk"
+      top_k: 30
+      ensemble_size: 48
+      max_iter: 8
+      seed: 0
+  - id: viz
+    task: viz.make
+    inputs: { assimilation: "@assim", runs: "@sim" }
+    params: { dashboard: ds }

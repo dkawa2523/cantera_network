@@ -11,11 +11,7 @@ from pathlib import Path, PurePath
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Union
 
 from rxn_platform.errors import ConfigError
-
-try:
-    import yaml
-except ImportError:  # pragma: no cover - optional dependency
-    yaml = None
+from rxn_platform.io_utils import read_yaml_payload, write_yaml_payload
 
 try:
     import numpy as np
@@ -171,34 +167,6 @@ else:
             return data
 
 
-def _read_yaml(path: Path) -> Any:
-    with path.open("r", encoding="utf-8") as handle:
-        if yaml is None:
-            try:
-                return json.load(handle)
-            except json.JSONDecodeError as exc:
-                raise ValueError(
-                    "PyYAML is not available; manifest must be JSON-compatible YAML."
-                ) from exc
-        return yaml.safe_load(handle)
-
-
-def _write_yaml(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        if yaml is None:
-            json.dump(payload, handle, indent=2, sort_keys=True)
-            handle.write("\n")
-            return
-        yaml.safe_dump(
-            payload,
-            handle,
-            allow_unicode=False,
-            default_flow_style=False,
-            sort_keys=True,
-        )
-
-
 def find_repo_root(start: Optional[Path] = None) -> Optional[Path]:
     """Return the repo root based on pyproject.toml or .git, if found."""
     base = start or Path.cwd()
@@ -233,14 +201,24 @@ def load_config(path: Union[str, Path]) -> Any:
     if not path.exists():
         raise ConfigError(f"Config not found: {path}")
     try:
-        return _read_yaml(path)
+        return read_yaml_payload(
+            path,
+            error_message=(
+                "PyYAML is not available; manifest must be JSON-compatible YAML."
+            ),
+            error_cls=ValueError,
+        )
     except (OSError, ValueError) as exc:
         raise ConfigError(f"Failed to load config from {path}: {exc}") from exc
 
 
 def load_manifest(path: Union[str, Path]) -> ArtifactManifest:
     path = Path(path)
-    payload = _read_yaml(path)
+    payload = read_yaml_payload(
+        path,
+        error_message="PyYAML is not available; manifest must be JSON-compatible YAML.",
+        error_cls=ValueError,
+    )
     try:
         return ArtifactManifest.from_dict(payload)
     except (TypeError, ValueError) as exc:
@@ -254,7 +232,7 @@ def dump_manifest(path: Union[str, Path], manifest: ArtifactManifest) -> None:
     normalized = _validate_manifest_dict(payload)
     if normalized.get("notes") is None:
         normalized.pop("notes", None)
-    _write_yaml(Path(path), normalized)
+    write_yaml_payload(Path(path), normalized, sort_keys=True)
 
 
 def _coerce_multiplier_value(

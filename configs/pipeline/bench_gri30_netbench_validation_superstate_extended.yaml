@@ -1,0 +1,52 @@
+# NetBench: validation pipeline computing superstate QoIs (features only, extended targets).
+steps:
+  - id: sim
+    task: sim.run_csv
+    sim:
+      name: cantera
+      mechanism: gri30.yaml
+      phase: gas
+      initial:
+        T: 1000.0
+        P: 101325.0
+        X:
+          CH4: 1.0
+          O2: 2.0
+          N2: 7.52
+      reactor:
+        type: IdealGasConstPressureReactor
+        energy: on
+      time_grid:
+        start: 0.0
+        stop: 1.0e-3
+        steps: 4
+      solver:
+        rtol: 1.0e-9
+        atol: 1.0e-15
+        max_steps: 100000
+    params:
+      conditions_file: benchmarks/assets/conditions/gri30_netbench_val.csv
+      case_id: va000
+
+  - id: qoi
+    task: features.superstate_qoi
+    inputs:
+      run_id: "@sim"
+      # Must be injected by the outer validation loop (reduction.validate).
+      mapping_id: MAPPING_ID_REQUIRED
+    params:
+      x_var: X
+      t_var: T
+      targets:
+        - { name: CO_final_super, member_species: CO, stat: last }
+        - { name: CO2_final_super, member_species: CO2, stat: last }
+        - { name: H2O_final_super, member_species: H2O, stat: last }
+        - { name: CH4_final_super, member_species: CH4, stat: last }
+        - { name: O2_final_super, member_species: O2, stat: last }
+        - { name: NO_final_super, member_species: NO, stat: last }
+        - { name: NO2_final_super, member_species: NO2, stat: last }
+        - { name: OH_max_super, member_species: OH, stat: max }
+        - { name: HO2_max_super, member_species: HO2, stat: max }
+      include_temperature_qoi: true
+      include_ignition_delay: true
+

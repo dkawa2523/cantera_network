@@ -1,0 +1,10 @@
+# @package _global_
+defaults:
+  - override /sim: placeholder
+  - override /task: placeholder
+  - override /pipeline: placeholder
+  - _self_
+
+recipe:
+  name: placeholder
+  description: Placeholder recipe for config composition tests.

@@ -109,8 +109,12 @@ def test_reduction_threshold_prune_score_threshold_protection(tmp_path) -> None:
     result = task(cfg, store=store)
 
     patch_payload = load_config(result.path / "mechanism_patch.yaml")
-    assert patch_payload["disabled_reactions"] == [{"reaction_id": "R2"}]
+    assert patch_payload["disabled_reactions"] == [{"index": 1}]
     assert patch_payload["reaction_multipliers"] == []
+
+    metrics = json.loads((result.path / "metrics.json").read_text(encoding="utf-8"))
+    assert metrics["kind"] == "threshold_prune_metrics"
+    assert "counts" in metrics
 
 
 def test_reduction_threshold_prune_top_k(tmp_path) -> None:
@@ -130,5 +134,9 @@ def test_reduction_threshold_prune_top_k(tmp_path) -> None:
     result = task(cfg, store=store)
 
     patch_payload = load_config(result.path / "mechanism_patch.yaml")
-    disabled = {entry["reaction_id"] for entry in patch_payload["disabled_reactions"]}
-    assert disabled == {"R1", "R2"}
+    disabled = {entry["index"] for entry in patch_payload["disabled_reactions"]}
+    assert disabled == {0, 1}
+
+    metrics = json.loads((result.path / "metrics.json").read_text(encoding="utf-8"))
+    assert metrics["kind"] == "threshold_prune_metrics"
+    assert metrics["counts"]["disabled_reactions"] == 2

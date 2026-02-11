@@ -1,0 +1,31 @@
+steps:
+  - id: sim_base
+    task: sim.sweep_csv
+    inputs: {}
+    params:
+      mechanism_path: ${mechanism.path}
+      conditions_file: ${benchmarks.conditions_file}
+      model: gri30
+  - id: obs
+    task: observables.compute
+    inputs: { runs: "@sim_base" }
+    params:
+      observables: [gas_composition, temperature_summary]
+  - id: opt
+    task: optimization.random_pareto
+    inputs: { runs: "@sim_base", observables: "@obs" }
+    params:
+      # multi-objective example: maximize CO2_final, minimize CO_final
+      objectives:
+        - name: maximize_CO2
+          target: "gas_composition:CO2_final"
+          direction: max
+        - name: minimize_CO
+          target: "gas_composition:CO_final"
+          direction: min
+      budget: 80
+      seed: 0
+  - id: viz
+    task: viz.make
+    inputs: { optimization: "@opt" }
+    params: { dashboard: ds }

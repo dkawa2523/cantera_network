@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,8 @@ try:  # Optional dependency (needed for xarray.to_zarr).
     import zarr  # noqa: F401
 except ImportError:  # pragma: no cover - optional dependency
     zarr = None
+
+logger = logging.getLogger(__name__)
 
 
 def _require_mapping(value: Any, label: str) -> Mapping[str, Any]:
@@ -164,14 +167,23 @@ def _reaction_labels(solution: Any) -> list[str]:
         equations = list(solution.reaction_equations())
         if len(equations) == count:
             return [str(entry) for entry in equations]
-    except Exception:
-        pass
+        logger.warning(
+            "Cantera reaction_equations length mismatch: expected %d, got %d.",
+            count,
+            len(equations),
+        )
+    except Exception as exc:
+        logger.warning("Cantera reaction_equations failed: %s", exc)
     labels: list[str] = []
+    had_failure = False
     for idx in range(count):
         try:
             labels.append(str(solution.reaction_equation(idx)))
         except Exception:
+            had_failure = True
             labels.append(f"R{idx + 1}")
+    if had_failure:
+        logger.warning("Cantera reaction_equation failed; using fallback labels.")
     return labels
 
 
@@ -187,13 +199,15 @@ def _apply_reaction_multipliers(
     if not hasattr(solution, "set_multiplier"):
         raise BackendError("Cantera solution does not support multipliers.")
 
+    needs_label = any("index" not in entry for entry in multipliers)
     label_to_index: dict[str, int] = {}
-    for idx, label in enumerate(reaction_names):
-        if label in label_to_index:
-            raise BackendError(
-                "Duplicate reaction identifiers detected in mechanism."
-            )
-        label_to_index[label] = idx
+    if needs_label:
+        for idx, label in enumerate(reaction_names):
+            if label in label_to_index:
+                raise BackendError(
+                    "Duplicate reaction identifiers detected in mechanism."
+                )
+            label_to_index[label] = idx
 
     applied: dict[int, dict[str, Any]] = {}
     for entry in multipliers:
@@ -266,7 +280,14 @@ class CanteraBackend(SimulationBackend):
         if phase is None:
             gas = ct.Solution(mechanism)
         else:
-            gas = ct.Solution(mechanism, name=phase)
+            try:
+                gas = ct.Solution(mechanism, name=phase)
+            except Exception:
+                # Cantera mechanisms like gri30.yaml use phase name "gri30" (not "gas").
+                # If users pass the common alias "gas", fall back to the default phase.
+                if phase != "gas":
+                    raise
+                gas = ct.Solution(mechanism)
 
         initial_cfg = _require_mapping(cfg.get("initial"), "initial")
         temperature = _as_float(initial_cfg.get("T"), "initial.T")

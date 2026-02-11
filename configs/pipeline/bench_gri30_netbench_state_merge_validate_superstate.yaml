@@ -1,0 +1,101 @@
+# NetBench: state merge (node_lumping -> reduced mechanism) + multi-case superstate QoI validation + viz
+steps:
+  - id: sim
+    task: sim.run_csv
+    sim: ${sim}
+    params:
+      conditions_file: ${benchmarks.conditions_file}
+      case_id: ${benchmarks.case_id}
+
+  - id: graph_mech
+    task: graphs.stoich
+    graphs:
+      mechanism: ${mechanism.path}
+    params: {}
+
+  - id: graph_flux
+    task: graphs.temporal_flux
+    inputs:
+      run_id: "@sim"
+      mechanism: ${mechanism.path}
+    params: {}
+
+  - id: node_lumping
+    task: reduction.node_lumping
+    inputs:
+      graph_id: "@graph_mech"
+    lumping:
+      method: threshold
+      threshold: 0.95
+      weights:
+        elements: 0.7
+        charge: 0.2
+        phase: 0.1
+        state: 0.0
+      charge_scale: 2.0
+      representative:
+        metric: degree
+
+  - id: red_state_merge
+    task: reduction.node_lumping_prune
+    inputs:
+      node_lumping: "@node_lumping"
+    mechanism: ${mechanism.path}
+    params:
+      # Evaluate the reduction as-is; QoIs will be redefined on superstates.
+      protected_species: []
+      require_same_composition: true
+      require_same_charge: true
+      # Bump when implementation changes and you need to avoid artifact cache reuse.
+      cache_bust: node_lumping_prune_v2
+
+  - id: val_state_merge
+    task: reduction.validate
+    inputs:
+      patches: ["@red_state_merge"]
+      # Resolved by the outer pipeline runner; used by inject_inputs via $inputs.mapping_id.
+      mapping_id: "@node_lumping"
+    mechanism: ${mechanism.path}
+    validation:
+      pipeline: bench_gri30_netbench_validation_superstate
+      case_mode: all
+      conditions_file: ${oc.select:benchmarks.validation_conditions_file,benchmarks/assets/conditions/gri30_netbench_val.csv}
+      metric: rel
+      tolerance: 0.5
+      stop_on_fail: false
+      # This is a mechanism replacement reduction, not multiplier-only.
+      use_multipliers_only: false
+      sim_step_id: sim
+      features_step_id: qoi
+      # Inject mapping_id into the inner validation pipeline step inputs.
+      inject_inputs:
+        qoi:
+          mapping_id: "$inputs.mapping_id"
+
+  - id: viz
+    task: viz.benchmark_report
+    name: bench_gri30_netbench_state_merge_validate_superstate
+    dashboard: benchmark
+    chart_backend: svg
+    export_images:
+      enabled: true
+      formats: [svg]
+      dir: images
+    inputs:
+      runs: "@sim"
+      graphs: ["@graph_mech", "@graph_flux"]
+      reduction: ["@red_state_merge"]
+      validation: ["@val_state_merge"]
+    graphviz:
+      top_n: 8
+      max_nodes: 80
+      max_edges: 160
+      engine_bipartite: dot
+      engine_flux: sfdp
+      export_dot: true
+      export_svg: true
+      plots: [top_rop, top_wdot, patch, top_rop_reduced, flux_species]
+    reduction_effect:
+      top_n: 12
+    params: {}
+

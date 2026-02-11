@@ -1,0 +1,85 @@
+# NetBench: ROP-based reduction + validation
+steps:
+  - id: sim
+    task: sim.run_csv
+    sim: ${sim}
+    params:
+      conditions_file: ${benchmarks.conditions_file}
+      case_id: ${benchmarks.case_id}
+  - id: features
+    task: features.run
+    inputs: { run_id: "@sim" }
+    params:
+      cache_bust: "2026-01-29"
+      features:
+        - name: rop_wdot_summary
+          params:
+            rop:
+              stats: [integral]
+              # Ensure threshold_prune can rank *all* reactions for meaningful top_k sweeps.
+              top_n: 400
+          rank_by: integral
+          rank_abs: true
+  - id: graph_mech
+    task: graphs.stoich
+    graphs:
+      mechanism: ${mechanism.path}
+    params: {}
+  - id: graph_flux
+    task: graphs.temporal_flux
+    inputs:
+      run_id: "@sim"
+      mechanism: ${mechanism.path}
+    params: {}
+  - id: reduction
+    task: reduction.threshold_prune
+    inputs:
+      features: "@features"
+    importance:
+      column: value
+      mode: abs
+      aggregate: mean
+    threshold:
+      top_k: 50
+  - id: validation
+    task: reduction.validate
+    inputs:
+      patches:
+        - "@reduction"
+    mechanism: ${mechanism.path}
+    validation:
+      pipeline: bench_gri30_netbench_validation
+      case_mode: all
+      # Default is val-set; override via benchmarks.validation_conditions_file when needed.
+      conditions_file: ${oc.select:benchmarks.validation_conditions_file,benchmarks/assets/conditions/gri30_netbench_val.csv}
+      metric: rel
+      tolerance: 0.5
+      stop_on_fail: false
+      use_multipliers_only: true
+      sim_step_id: sim
+      observables_step_id: observables
+      features_step_id: features
+  - id: viz
+    task: viz.benchmark_report
+    name: bench_gri30_netbench_reduce_rop
+    dashboard: benchmark
+    chart_backend: svg
+    export_images:
+      enabled: true
+      formats: [svg]
+      dir: images
+    inputs:
+      runs: "@sim"
+      graphs: ["@graph_mech", "@graph_flux"]
+      reduction:
+        - "@reduction"
+      validation:
+        - "@validation"
+    graphviz:
+      top_n: 8
+      max_nodes: 80
+      max_edges: 160
+      engine: dot
+    reduction_effect:
+      top_n: 12
+    params: {}

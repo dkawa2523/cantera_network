@@ -1,0 +1,9 @@
+# @package _global_
+defaults:
+  - override /sim: dummy
+  - override /pipeline: p1_smoke
+  - _self_
+
+recipe:
+  name: viz_report
+  description: Generate a smoke dashboard report for RunStore layout checks.

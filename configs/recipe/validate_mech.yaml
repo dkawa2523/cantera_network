@@ -1,0 +1,18 @@
+# @package _global_
+defaults:
+  - override /sim: dummy
+  - override /pipeline: validate_mech
+  - _self_
+
+recipe:
+  name: validate_mech
+  description: Validate reduced mechanism against baseline QoI.
+
+sim:
+  mechanism: configs/mechanism/dummy_minimal.yaml
+  reactions:
+    - R1
+    - R2
+  outputs:
+    include_rop: true
+    include_wdot: true

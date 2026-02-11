@@ -1,0 +1,22 @@
+steps:
+  - id: sim
+    task: sim.sweep_csv
+    inputs: {}
+    params:
+      mechanism_path: ${mechanism.path}
+      conditions_file: ${benchmarks.conditions_file}
+      model: gri30
+  - id: g
+    task: graphs.build
+    inputs: { runs: "@sim" }
+    params: {}
+  - id: f
+    task: features.extract
+    inputs: { runs: "@sim", graph: "@g" }
+    params:
+      feature_sets: [timeseries_summary, rop_summary]
+      rop_top_n: 50
+  - id: viz
+    task: viz.make
+    inputs: { runs: "@sim", graph: "@g", features: "@f" }
+    params: { dashboard: ds }

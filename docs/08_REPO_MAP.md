@@ -5,7 +5,7 @@
 観測できない項目は `TODO:` として残す（捏造しない）。
 
 ## 1. 走査結果サマリ
-- ルート直下には `AGENTS.md`, `docs/`, `work/`, `tools/`, `external/`, `src/`, `configs/`, `artifacts/`, `tests/` があり、隠しディレクトリとして `.codex/`, `.git/`, `.venv/` が存在する（ローカル環境由来の可能性あり）。
+- ルート直下には `AGENTS.md`, `docs/`, `work/`, `tools/`, `external/`, `src/`, `configs/`, `artifacts/`, `tests/` があり、隠しディレクトリとして `.git/`, `.venv/`, `.codex/` が **存在し得る**（ローカル環境由来の可能性あり）。
 - `rxn_platform` の実装は `src/rxn_platform/` に集約され、ルート直下の `rxn_platform/` は `src/` を参照する shim。
 - リポジトリ内で確認できた Python 実行コードは `src/rxn_platform/**.py`、`external/cantera_v1/exampleA.py`、`external/cantera_v1/cantera_semicon_starter_kit/run_cstr_semicon_cantera.py`、`external/cantera_v1/cantera_semicon_starter_kit/make_reactions_from_csv.py`、`external/cantera_v1/cantera_semicon_starter_kit/ck_filter_plasma_to_neutral.py`、`tools/codex_loop/run_loop.py`。
 - 確認できた JSON は `work/queue.json`, `work/state.json`, `tools/codex_loop/response_schema.json` で、いずれも運用/スキーマ用途。
@@ -24,7 +24,7 @@
 - `external/cantera_v1/composition_profiles.csv`: `exampleA.py` が出力した CSV。ヘッダは `time_s` + species 名、各行が時刻とモル分率履歴。
 - `external/cantera_v1/cantera_semicon_starter_kit/reactions_block.txt`: `make_reactions_from_csv.py` に相当する CHEMKIN 反応ブロックの生成物（テキスト）。
 - `run_cstr_semicon_cantera.py` は stdout に定常組成と Arrhenius サンプルを出力（ファイル出力なし）。
-- 既存の運用ログは `work/logs/<task_id>_<timestamp>/` にあり、`prompt.md` や `codex_stdout.txt` / `codex_stderr.txt` / `codex_last_message.json` が確認できる（Codex 自動実装ループのログ）。
+- Codex 自動実装ループを回した場合、運用ログが `work/logs/<task_id>_<timestamp>/` に生成され、`prompt.md` や `codex_stdout.txt` / `codex_stderr.txt` / `codex_last_message.json` が確認できる。
 - `artifacts/` は存在し、初期状態では `.gitkeep` のみ。RunArtifact などは実行により生成される。
 - TODO: リポジトリ外の既存資産がある場合は出力形式を追記する。
 
@@ -38,7 +38,7 @@
 
 ## 5. 既存の自動実行方式
 - Cantera 実行は手動実行（`external/cantera_v1/README.md` と `external/cantera_v1/cantera_semicon_starter_kit/README_ja.md` に手順記載）。CI（`.github/workflows`）や一括スイープは見当たらない。
-- `tools/codex_loop/run_loop.py` が `work/queue.json` を読み、Codex 実装ループを回す（ログは `work/logs/`）。
+- `tools/codex_loop/run_loop.py` が `work/queue.json` を読み、Codex 実装ループを回す（ログは `work/logs/` に生成される）。
 - TODO: リポジトリ外の既存資産に自動実行（CI/バッチ/スイープ）がある場合は追記する。
 
 ## 6. 既存資産と新基盤の共存方針

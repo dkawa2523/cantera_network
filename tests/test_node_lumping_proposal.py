@@ -92,9 +92,20 @@ def test_node_lumping_proposal(tmp_path) -> None:
         for item in payload["similarity"]["pairs"]
         if {item["species_a"], item["species_b"]} == {"A", "B"}
     )
-    assert set(pair["components"].keys()) == {"elements", "charge", "phase", "state"}
+    assert set(pair["components"].keys()) == {
+        "elements",
+        "charge",
+        "phase",
+        "state",
+        "reaction_type_profile",
+        "neighbor_reaction",
+    }
 
     cluster = next(
         item for item in payload["clusters"] if set(item["members"]) == {"A", "B"}
     )
     assert cluster["selection"]["metric"] == "degree"
+
+    # Shared mapping output for downstream consumers (projection QoI, etc.).
+    mapping_payload = load_config(result.path / "mapping.json")
+    assert mapping_payload["kind"] == "superstate_mapping"

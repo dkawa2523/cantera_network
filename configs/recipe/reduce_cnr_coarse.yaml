@@ -1,0 +1,14 @@
+# @package _global_
+defaults:
+  - override /sim: dummy
+  - override /pipeline: reduce_cnr_coarse
+  - _self_
+
+recipe:
+  name: reduce_cnr_coarse
+  description: Build temporal flux graph, CNR-Coarse mapping, and superstate features.
+
+sim:
+  outputs:
+    include_rop: true
+    include_wdot: true

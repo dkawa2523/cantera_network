@@ -15,7 +15,7 @@ def test_p2_integration_dummy_pipeline(tmp_path: Path) -> None:
     store_root = tmp_path / "artifacts"
     cfg = compose_config(
         config_path=_config_dir(),
-        config_name="defaults",
+        config_name="default",
         overrides=[
             f"store.root={store_root}",
             "pipeline=p2_smoke",

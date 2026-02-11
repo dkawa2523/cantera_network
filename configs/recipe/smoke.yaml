@@ -1,0 +1,10 @@
+# @package _global_
+defaults:
+  - override /sim: dummy
+  - override /task: sim_run
+  - override /pipeline: smoke
+  - _self_
+
+recipe:
+  name: smoke
+  description: Dummy smoke pipeline.

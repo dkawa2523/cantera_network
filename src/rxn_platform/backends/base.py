@@ -5,10 +5,10 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass
-import json
 from pathlib import Path
 from typing import Any
 
+from rxn_platform.io_utils import write_json_atomic
 try:  # Optional dependency.
     import xarray as xr
 except ImportError:  # pragma: no cover - optional dependency
@@ -48,13 +48,7 @@ def dump_run_dataset(dataset: Any, path: Path) -> None:
         return
     if isinstance(dataset, RunDataset):
         path.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(
-            dataset.to_dict(),
-            ensure_ascii=True,
-            sort_keys=True,
-            indent=2,
-        )
-        (path / "dataset.json").write_text(payload + "\n", encoding="utf-8")
+        write_json_atomic(path / "dataset.json", dataset.to_dict())
         return
     raise TypeError(
         "Unsupported run dataset type; expected RunDataset or xarray.Dataset."

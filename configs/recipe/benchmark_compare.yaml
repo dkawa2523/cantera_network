@@ -1,0 +1,16 @@
+# @package _global_
+defaults:
+  - override /sim: dummy
+  - override /pipeline: benchmark_compare
+  - _self_
+
+recipe:
+  name: benchmark_compare
+  description: Compare multiple reducers on a shared benchmark and emit a report.
+
+sim:
+  mechanism: configs/mechanism/dummy_minimal.yaml
+  reactions: [R1, R2]
+  outputs:
+    include_rop: true
+    include_wdot: true

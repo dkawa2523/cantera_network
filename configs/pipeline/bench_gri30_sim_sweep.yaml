@@ -1,0 +1,13 @@
+# Benchmark: Cantera multi-condition sweep (gri30)
+steps:
+  - id: sim
+    task: sim.sweep_csv
+    inputs: {}
+    params:
+      mechanism_path: ${mechanism.path}
+      conditions_file: ${benchmarks.conditions_file}
+      model: gri30
+  - id: viz
+    task: viz.make
+    inputs: { runs: "@sim" }
+    params: { dashboard: ds }

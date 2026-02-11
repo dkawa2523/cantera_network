@@ -6,27 +6,19 @@
 
 ```
 configs/
-  defaults.yaml
-  sim/
-    cantera_0d.yaml
-    dummy.yaml
-  task/
-    graphs.yaml
-    features.yaml
-    sensitivity.yaml
-    assimilation_eki.yaml
-    reduction_threshold.yaml
-    viz_ds.yaml
-  pipeline/
-    assimilate.yaml
-    reduce_validate.yaml
-    optimize_conditions.yaml
+  default.yaml
+  defaults.yaml          # 互換エイリアス（legacy）
+  recipe/
+    smoke.yaml
+    sim_sweep.yaml
+  sim/                   # legacy: 個別の詳細設定
+  task/                  # legacy: カテゴリ単体の設定
+  pipeline/              # legacy: step列（taskを並べる）
 ```
 
-- `defaults.yaml`: store/logging/seed等の共通デフォルト
-- `sim/*`: backendと反応器モデル設定
-- `task/*`: カテゴリ単体の設定
-- `pipeline/*`: step列（taskを並べる）
+- **新しい入口**は `default.yaml` + `recipe/*.yaml`
+- `recipe/*` が `sim/task/pipeline` の組み合わせを選ぶ
+- `sim/task/pipeline` は **互換・再利用のために残す**（詳細は `04_CONFIG_SIMPLIFICATION.md`）
 
 > 現時点このリポジトリには `conf/` や `config/` ディレクトリは存在しない。外部既存リポジトリで使われている場合は、衝突を避けるため `configs/` に寄せる。
 
@@ -37,8 +29,8 @@ configs/
 - “同じ条件が2箇所で定義される”状態を禁止（source of truthは1つ）
 
 ## 3. run dir / sweep dir
-- `hydra.run.dir` は `artifacts/_hydra_runs/<timestamp>/<job_name>` のように、成果物（Artifact）とは分離する
-- 解析成果物は `artifacts/` へ出す（hydra run dir に散らばらせない）
+- `hydra.run.dir` は RunStore 配下（`runs/<exp>/<run_id>/hydra`）に寄せる
+- 解析成果物は RunStore 内の `artifacts/` へ出す
 
 ## 4. Seed
 - `seed` は全カテゴリで共通キーにする（例: `common.seed`）

@@ -20,6 +20,10 @@ artifacts/
       manifest.yaml
       state.zarr/              # 主要データ（xarray.Dataset）
       logs.txt                 # 任意: 実行ログ
+  run_sets/
+    <run_set_id>/
+      manifest.yaml
+      runs.json                # case_id と run_id の対応（デバッグ/可視化用）
   observables/
     <obs_id>/
       manifest.yaml
@@ -69,7 +73,7 @@ artifacts/
 
 ```yaml
 schema_version: 1
-kind: runs | observables | graphs | features | sensitivity | models | reduction | validation | reports
+kind: runs | run_sets | observables | graphs | features | sensitivity | models | reduction | validation | reports
 id: <artifact_id>
 created_at: "2026-01-17T00:00:00Z"
 parents: []          # 親artifact_id（派生関係）
@@ -107,6 +111,19 @@ notes: "<free text>"
 ### 5.3 “必要データ宣言”
 下流の Task/Observable/Feature は「必要な変数」を宣言する。
 足りない場合は **静かに無視しない**（例外 or 明確なwarn）。
+
+## 5.4 RunSetArtifact（複数条件run束ね）契約
+
+複数条件（CSV全件など）の run を「1つの入力参照」として下流に渡すためのArtifact。
+
+### 必須
+- kind: `run_sets`
+- `manifest.inputs.run_ids`: 対象 run_id の配列（空でない）
+- `manifest.inputs.case_ids`: 条件の識別子（`run_ids` と同順）
+- `manifest.inputs.case_to_run`: `{case_id: run_id}` の対応表
+
+### 推奨
+- `runs.json`: 上記 inputs のコピーに加え、CSV行のメタ（T0/P0_atm/phi/t_end 等）を保持
 
 ## 6. ObservableArtifact（目的変数）契約
 

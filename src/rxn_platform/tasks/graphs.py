@@ -2,23 +2,33 @@
 
 from __future__ import annotations
 
+from bisect import bisect_left
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
 import json
+import logging
 import math
-import platform
 from pathlib import Path
 import re
-import subprocess
 from typing import Any, Optional
-
-from rxn_platform import __version__
-from rxn_platform.core import ArtifactManifest, make_artifact_id
+from rxn_platform.core import make_artifact_id, stable_hash
 from rxn_platform.errors import ArtifactError, ConfigError
-from rxn_platform.hydra_utils import resolve_config
+from rxn_platform.io_utils import read_json, write_json_atomic
+from rxn_platform.mechanism import read_yaml_payload as _read_mech_yaml_payload
+from rxn_platform.graphs.temporal_flux_graph import build_temporal_flux_graph
 from rxn_platform.registry import Registry, register
+from rxn_platform.run_store import (
+    resolve_run_root_from_store,
+    sync_temporal_graph_from_artifact,
+)
 from rxn_platform.store import ArtifactCacheResult, ArtifactStore
+from rxn_platform.tasks.common import (
+    build_manifest,
+    code_metadata as _code_metadata,
+    load_run_dataset_payload,
+    load_run_ids_from_run_set,
+    resolve_cfg as _resolve_cfg,
+)
 
 try:  # Optional dependency.
     import cantera as ct
@@ -30,6 +40,8 @@ try:  # Optional dependency.
 except ImportError:  # pragma: no cover - optional dependency
     np = None
 
+logger = logging.getLogger(__name__)
+
 try:  # Optional dependency.
     import scipy.sparse as sp
 except ImportError:  # pragma: no cover - optional dependency
@@ -39,11 +51,6 @@ try:  # Optional dependency.
     import networkx as nx
 except ImportError:  # pragma: no cover - optional dependency
     nx = None
-
-try:  # Optional dependency.
-    import xarray as xr
-except ImportError:  # pragma: no cover - optional dependency
-    xr = None
 
 
 @dataclass(frozen=True)
@@ -65,19 +72,13 @@ class LaplacianResult:
     normalized_format: Optional[str]
 
 
-def _utc_now_iso() -> str:
-    timestamp = datetime.now(timezone.utc).replace(microsecond=0)
-    return timestamp.isoformat().replace("+00:00", "Z")
-
-
-def _resolve_cfg(cfg: Any) -> dict[str, Any]:
-    try:
-        resolved = resolve_config(cfg)
-    except ConfigError:
-        if isinstance(cfg, Mapping):
-            return dict(cfg)
-        raise
-    return resolved
+@dataclass(frozen=True)
+class TimeWindow:
+    index: int
+    start_idx: int
+    end_idx: int
+    start_time: float
+    end_time: float
 
 
 def _extract_graph_cfg(cfg: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -122,6 +123,25 @@ def _coerce_str_sequence(value: Any, label: str) -> list[str]:
     raise ConfigError(f"{label} must be a string or sequence of strings.")
 
 
+def _extract_params(cfg: Mapping[str, Any]) -> dict[str, Any]:
+    params = cfg.get("params", {})
+    if params is None:
+        params = {}
+    if not isinstance(params, Mapping):
+        raise ConfigError("graph.params must be a mapping.")
+    return dict(params)
+
+
+def _find_value(sources: Sequence[Mapping[str, Any]], keys: Sequence[str]) -> Any:
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        for key in keys:
+            if key in source and source.get(key) is not None:
+                return source.get(key)
+    return None
+
+
 def _normalize_mechanism(value: Any) -> str:
     mech = _require_nonempty_str(value, "mechanism")
     mech_path = Path(mech)
@@ -154,6 +174,35 @@ def _extract_mechanism(graph_cfg: Mapping[str, Any]) -> tuple[str, Optional[str]
 
     mechanism = _normalize_mechanism(mechanism)
 
+    if phase is not None:
+        phase = _require_nonempty_str(phase, "phase")
+    return mechanism, phase
+
+
+def _extract_optional_mechanism(
+    graph_cfg: Mapping[str, Any],
+    params: Mapping[str, Any],
+) -> tuple[Optional[str], Optional[str]]:
+    mechanism: Any = None
+    phase: Any = None
+    inputs = graph_cfg.get("inputs")
+    if inputs is not None and not isinstance(inputs, Mapping):
+        raise ConfigError("graphs.inputs must be a mapping.")
+    sources: list[Mapping[str, Any]] = []
+    if isinstance(inputs, Mapping):
+        sources.append(inputs)
+    sources.append(params)
+    sources.append(graph_cfg)
+
+    mechanism = _find_value(
+        sources,
+        ("mechanism", "solution", "mechanism_path", "source"),
+    )
+    phase = _find_value(sources, ("phase",))
+
+    if mechanism is None:
+        return None, None
+    mechanism = _normalize_mechanism(mechanism)
     if phase is not None:
         phase = _require_nonempty_str(phase, "phase")
     return mechanism, phase
@@ -193,57 +242,64 @@ def _extract_run_id(graph_cfg: Mapping[str, Any]) -> str:
     return _coerce_single_run_id(run_id)
 
 
-def _code_metadata() -> dict[str, Any]:
-    payload: dict[str, Any] = {"version": __version__}
-    git_dir = Path.cwd() / ".git"
-    if not git_dir.exists():
-        return payload
-    try:
-        commit = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
-        payload["git_commit"] = commit
-        dirty = subprocess.check_output(
-            ["git", "status", "--porcelain"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
-        payload["dirty"] = bool(dirty)
-    except (OSError, subprocess.SubprocessError):
-        return payload
-    return payload
-
-
-def _provenance_metadata() -> dict[str, Any]:
-    return {"python": platform.python_version()}
-
-
-def _load_run_dataset_payload(run_dir: Path) -> dict[str, Any]:
-    dataset_path = run_dir / "state.zarr" / "dataset.json"
-    if dataset_path.exists():
-        try:
-            payload = json.loads(dataset_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise ArtifactError(f"Run dataset JSON is invalid: {exc}") from exc
-        if not isinstance(payload, Mapping):
-            raise ArtifactError("Run dataset JSON must be a mapping.")
-        return dict(payload)
-    if xr is None:
-        raise ArtifactError(
-            "Run dataset not found; install xarray to load state.zarr."
+def _extract_run_ids(
+    graph_cfg: Mapping[str, Any],
+    params: Mapping[str, Any],
+    *,
+    store: Optional[ArtifactStore] = None,
+) -> list[str]:
+    inputs = graph_cfg.get("inputs")
+    if inputs is not None and not isinstance(inputs, Mapping):
+        raise ConfigError("graphs.inputs must be a mapping.")
+    run_set_id: Any = None
+    explicit_runs_present = False
+    if isinstance(inputs, Mapping):
+        if "run_set_id" in inputs:
+            run_set_id = inputs.get("run_set_id")
+        for key in ("run_ids", "runs", "run_id", "run"):
+            if key in inputs:
+                explicit_runs_present = True
+                break
+    if run_set_id is None and "run_set_id" in graph_cfg:
+        run_set_id = graph_cfg.get("run_set_id")
+        explicit_runs_present = explicit_runs_present or any(
+            key in graph_cfg for key in ("run_ids", "runs", "run_id", "run")
         )
-    dataset = xr.open_zarr(run_dir / "state.zarr")
-    coords = {
-        name: {"dims": [name], "data": dataset.coords[name].values.tolist()}
-        for name in dataset.coords
-    }
-    data_vars = {
-        name: {"dims": list(dataset[name].dims), "data": dataset[name].values.tolist()}
-        for name in dataset.data_vars
-    }
-    return {"coords": coords, "data_vars": data_vars, "attrs": dict(dataset.attrs)}
+    if run_set_id is not None:
+        if explicit_runs_present:
+            raise ConfigError("Specify only one of run_set_id or run_id(s).")
+        run_set_id = _require_nonempty_str(run_set_id, "run_set_id")
+        if store is None:
+            raise ConfigError("run_set_id requires a store to be provided.")
+        run_ids = load_run_ids_from_run_set(store, run_set_id)
+        if not run_ids:
+            raise ConfigError("run_set_id resolved to an empty run_ids list.")
+        return run_ids
+    sources: list[Mapping[str, Any]] = []
+    if isinstance(inputs, Mapping):
+        sources.append(inputs)
+    sources.append(params)
+    sources.append(graph_cfg)
+
+    run_ids_value = _find_value(
+        sources,
+        (
+            "run_ids",
+            "runs",
+            "run_id",
+            "run",
+            "condition_ids",
+            "conditions",
+        ),
+    )
+    if run_ids_value is None:
+        raise ConfigError("run_id or run_ids is required for temporal graphs.")
+    if isinstance(run_ids_value, str):
+        return [_require_nonempty_str(run_ids_value, "run_id")]
+    run_ids = _coerce_str_sequence(run_ids_value, "run_ids")
+    if not run_ids:
+        raise ConfigError("run_ids must include at least one entry.")
+    return run_ids
 
 
 def _extract_coord_names(payload: Mapping[str, Any], coord: str) -> list[str]:
@@ -254,6 +310,96 @@ def _extract_coord_names(payload: Mapping[str, Any], coord: str) -> list[str]:
     if not isinstance(coord_payload, Mapping):
         return []
     return _coerce_str_sequence(coord_payload.get("data"), f"coords.{coord}.data")
+
+
+def _extract_coord_values(payload: Mapping[str, Any], coord: str) -> list[Any]:
+    coords = payload.get("coords", {})
+    if not isinstance(coords, Mapping):
+        raise ArtifactError("Run dataset coords must be a mapping.")
+    coord_payload = coords.get(coord)
+    if not isinstance(coord_payload, Mapping):
+        return []
+    data = coord_payload.get("data")
+    if not isinstance(data, Sequence) or isinstance(data, (str, bytes, bytearray)):
+        raise ArtifactError(f"coords.{coord}.data must be a sequence.")
+    return list(data)
+
+
+def _extract_time_values(payload: Mapping[str, Any]) -> list[float]:
+    values = _extract_coord_values(payload, "time")
+    if not values:
+        raise ArtifactError("Run dataset missing coords.time.")
+    time_values: list[float] = []
+    for entry in values:
+        try:
+            time_values.append(float(entry))
+        except (TypeError, ValueError) as exc:
+            raise ArtifactError("coords.time entries must be numeric.") from exc
+    return time_values
+
+
+def _extract_time_matrix(
+    payload: Mapping[str, Any],
+    *,
+    var_name: str,
+    axis: str,
+    axis_names: Sequence[str],
+) -> list[list[float]]:
+    data_vars = payload.get("data_vars", {})
+    if not isinstance(data_vars, Mapping):
+        raise ArtifactError("Run dataset data_vars must be a mapping.")
+    var_payload = data_vars.get(var_name)
+    if not isinstance(var_payload, Mapping):
+        raise ArtifactError(f"data_vars.{var_name} must be a mapping.")
+    dims = var_payload.get("dims")
+    data = var_payload.get("data")
+    if isinstance(dims, str) or not isinstance(dims, Sequence):
+        raise ArtifactError(f"data_vars.{var_name}.dims must be a sequence.")
+    dims_list = list(dims)
+    if dims_list == ["time", axis]:
+        matrix = _coerce_matrix(data, axis)
+        for row in matrix:
+            if len(row) != len(axis_names):
+                raise ArtifactError(
+                    f"{var_name} columns mismatch: expected {len(axis_names)}, got {len(row)}."
+                )
+        return matrix
+    if dims_list == [axis, "time"]:
+        matrix = _coerce_matrix(data, axis)
+        if len(matrix) != len(axis_names):
+            raise ArtifactError(
+                f"{var_name} rows mismatch: expected {len(axis_names)}, got {len(matrix)}."
+            )
+        return _transpose_matrix(matrix)
+    raise ArtifactError(
+        f"data_vars.{var_name}.dims must be [time, {axis}] or [{axis}, time]."
+    )
+
+
+def _coerce_matrix(value: Any, label: str) -> list[list[float]]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        raise ArtifactError(f"{label} data must be a sequence of rows.")
+    matrix: list[list[float]] = []
+    for row in value:
+        if not isinstance(row, Sequence) or isinstance(
+            row,
+            (str, bytes, bytearray),
+        ):
+            raise ArtifactError(f"{label} rows must be sequences.")
+        row_values: list[float] = []
+        for entry in row:
+            try:
+                row_values.append(float(entry))
+            except (TypeError, ValueError) as exc:
+                raise ArtifactError(f"{label} entries must be numeric.") from exc
+        matrix.append(row_values)
+    if not matrix:
+        raise ArtifactError(f"{label} must contain at least one row.")
+    return matrix
+
+
+def _transpose_matrix(matrix: Sequence[Sequence[float]]) -> list[list[float]]:
+    return [list(row) for row in zip(*matrix)]
 
 
 def _build_run_bipartite_graph(
@@ -336,6 +482,528 @@ def _build_run_bipartite_graph(
     }
 
 
+def _sort_time_series(
+    time_values: Sequence[float],
+    matrix: Sequence[Sequence[float]],
+) -> tuple[list[float], list[list[float]]]:
+    order = sorted(range(len(time_values)), key=lambda idx: time_values[idx])
+    if order == list(range(len(time_values))):
+        return list(time_values), [list(row) for row in matrix]
+    sorted_time = [float(time_values[idx]) for idx in order]
+    sorted_matrix = [list(matrix[idx]) for idx in order]
+    return sorted_time, sorted_matrix
+
+
+def _build_fixed_windows(
+    time_values: Sequence[float],
+    n_windows: int,
+) -> list[TimeWindow]:
+    if not time_values:
+        raise ConfigError("time values are required for windowing.")
+    n_points = len(time_values)
+    n_windows = min(max(int(n_windows), 1), n_points)
+    if n_windows == 1:
+        return [
+            TimeWindow(
+                index=0,
+                start_idx=0,
+                end_idx=n_points - 1,
+                start_time=float(time_values[0]),
+                end_time=float(time_values[-1]),
+            )
+        ]
+    windows: list[TimeWindow] = []
+    for idx in range(n_windows):
+        start_idx = int(round(idx * (n_points - 1) / n_windows))
+        end_idx = int(round((idx + 1) * (n_points - 1) / n_windows))
+        if end_idx <= start_idx:
+            end_idx = min(start_idx + 1, n_points - 1)
+        windows.append(
+            TimeWindow(
+                index=idx,
+                start_idx=start_idx,
+                end_idx=end_idx,
+                start_time=float(time_values[start_idx]),
+                end_time=float(time_values[end_idx]),
+            )
+        )
+    return windows
+
+
+def _window_indices_from_boundaries(
+    time_values: Sequence[float],
+    boundaries: Sequence[float],
+) -> list[int]:
+    n_points = len(time_values)
+    indices = [0]
+    for boundary in boundaries[1:-1]:
+        idx = bisect_left(time_values, boundary)
+        idx = max(0, min(idx, n_points - 1))
+        indices.append(idx)
+    indices.append(n_points - 1)
+    for i in range(1, len(indices)):
+        if indices[i] <= indices[i - 1]:
+            indices[i] = min(indices[i - 1] + 1, n_points - 1)
+    return indices
+
+
+def _build_windows_from_boundaries(
+    time_values: Sequence[float],
+    boundaries: Sequence[float],
+) -> list[TimeWindow]:
+    indices = _window_indices_from_boundaries(time_values, boundaries)
+    windows: list[TimeWindow] = []
+    for idx in range(len(indices) - 1):
+        start_idx = indices[idx]
+        end_idx = indices[idx + 1]
+        if end_idx < start_idx:
+            end_idx = start_idx
+        windows.append(
+            TimeWindow(
+                index=idx,
+                start_idx=start_idx,
+                end_idx=end_idx,
+                start_time=float(time_values[start_idx]),
+                end_time=float(time_values[end_idx]),
+            )
+        )
+    return windows
+
+
+def _build_log_time_windows(
+    time_values: Sequence[float],
+    *,
+    n_windows: int,
+    base: float,
+) -> list[TimeWindow]:
+    if np is None:
+        raise ConfigError("numpy is required for log_time windowing.")
+    if not time_values:
+        raise ConfigError("time values are required for windowing.")
+    n_points = len(time_values)
+    n_windows = min(max(int(n_windows), 1), n_points)
+    if n_windows == 1:
+        return _build_fixed_windows(time_values, n_windows=1)
+    t_min = float(time_values[0])
+    t_max = float(time_values[-1])
+    if t_max <= t_min:
+        return _build_fixed_windows(time_values, n_windows=n_windows)
+    positive_times = [t for t in time_values if t > 0.0]
+    if not positive_times:
+        return _build_fixed_windows(time_values, n_windows=n_windows)
+    t_start = min(positive_times)
+    if t_start <= 0.0 or t_start >= t_max:
+        return _build_fixed_windows(time_values, n_windows=n_windows)
+    if base <= 0.0:
+        raise ConfigError("windowing.base must be positive.")
+    log_start = math.log(t_start, base)
+    log_end = math.log(t_max, base)
+    if log_end <= log_start:
+        return _build_fixed_windows(time_values, n_windows=n_windows)
+    boundaries = np.logspace(log_start, log_end, n_windows + 1, base=base).tolist()
+    boundaries[0] = t_min
+    boundaries[-1] = t_max
+    return _build_windows_from_boundaries(time_values, boundaries)
+
+
+def _build_event_windows(
+    time_values: Sequence[float],
+    activity: Sequence[float],
+    *,
+    n_windows: int,
+) -> list[TimeWindow]:
+    if np is None:
+        raise ConfigError("numpy is required for event_based windowing.")
+    if not time_values:
+        raise ConfigError("time values are required for windowing.")
+    n_points = len(time_values)
+    n_windows = min(max(int(n_windows), 1), n_points)
+    if len(activity) != n_points:
+        raise ConfigError("activity length must match time values.")
+    if n_windows == 1:
+        return _build_fixed_windows(time_values, n_windows=1)
+    cumulative = [0.0] * n_points
+    for idx in range(1, n_points):
+        dt = float(time_values[idx]) - float(time_values[idx - 1])
+        cumulative[idx] = cumulative[idx - 1] + 0.5 * (
+            float(activity[idx]) + float(activity[idx - 1])
+        ) * dt
+    total = cumulative[-1]
+    if total <= 0.0:
+        return _build_fixed_windows(time_values, n_windows=n_windows)
+    boundaries = [float(time_values[0])]
+    for window_idx in range(1, n_windows):
+        target = total * window_idx / float(n_windows)
+        idx = bisect_left(cumulative, target)
+        idx = max(0, min(idx, n_points - 1))
+        boundaries.append(float(time_values[idx]))
+    boundaries.append(float(time_values[-1]))
+    return _build_windows_from_boundaries(time_values, boundaries)
+
+
+def _normalize_windowing_cfg(
+    params: Mapping[str, Any],
+    graph_cfg: Mapping[str, Any],
+) -> dict[str, Any]:
+    windowing = _find_value(
+        [params, graph_cfg],
+        ("windowing", "windows", "window"),
+    )
+    if windowing is None:
+        return {"type": "log_time", "count": 4, "base": 10.0}
+    if isinstance(windowing, str):
+        return {"type": windowing, "count": 4, "base": 10.0}
+    if not isinstance(windowing, Mapping):
+        raise ConfigError("windowing must be a mapping or string.")
+    windowing_cfg = dict(windowing)
+    window_type = windowing_cfg.get("type") or windowing_cfg.get("mode") or windowing_cfg.get(
+        "kind"
+    )
+    if window_type is None:
+        window_type = "log_time"
+    if not isinstance(window_type, str) or not window_type.strip():
+        raise ConfigError("windowing.type must be a non-empty string.")
+    count = windowing_cfg.get("count")
+    if count is None:
+        count = windowing_cfg.get("windows")
+    if count is None:
+        count = windowing_cfg.get("n_windows")
+    if count is None:
+        count = windowing_cfg.get("n")
+    count = _coerce_positive_int(count, "windowing.count", default=4)
+    base = windowing_cfg.get("base", 10.0)
+    base = _coerce_float(base, "windowing.base")
+    return {"type": window_type.strip(), "count": count, "base": base, "raw": windowing_cfg}
+
+
+def _normalize_aggregation_cfg(
+    params: Mapping[str, Any],
+    graph_cfg: Mapping[str, Any],
+) -> dict[str, float]:
+    agg_cfg = _find_value(
+        [params, graph_cfg],
+        ("aggregation", "aggregate", "condition_aggregate"),
+    )
+    if agg_cfg is None:
+        agg_cfg = {}
+    if not isinstance(agg_cfg, Mapping):
+        raise ConfigError("aggregation must be a mapping.")
+    agg_cfg = dict(agg_cfg)
+    mix_cfg = agg_cfg.get("mix") or agg_cfg.get("weights") or agg_cfg
+    if not isinstance(mix_cfg, Mapping):
+        raise ConfigError("aggregation.mix must be a mapping when provided.")
+    mean_weight = _coerce_optional_float(
+        mix_cfg.get("mean", mix_cfg.get("mean_weight")), "aggregation.mean"
+    )
+    p95_weight = _coerce_optional_float(
+        mix_cfg.get("p95", mix_cfg.get("p95_weight")), "aggregation.p95"
+    )
+    if mean_weight is None and p95_weight is None:
+        mean_weight = 0.5
+        p95_weight = 0.5
+    if mean_weight is None:
+        mean_weight = 0.0
+    if p95_weight is None:
+        p95_weight = 0.0
+    total = mean_weight + p95_weight
+    if total <= 0.0:
+        raise ConfigError("aggregation weights must sum to a positive value.")
+    return {"mean": mean_weight / total, "p95": p95_weight / total}
+
+
+def _normalize_sparsify_cfg(
+    params: Mapping[str, Any],
+    graph_cfg: Mapping[str, Any],
+) -> dict[str, Optional[float]]:
+    sparsify_cfg = _find_value(
+        [params, graph_cfg],
+        ("sparsify", "sparsification", "sparse"),
+    )
+    if sparsify_cfg is None:
+        return {"quantile": None, "min_value": None}
+    if not isinstance(sparsify_cfg, Mapping):
+        raise ConfigError("sparsify must be a mapping.")
+    sparsify_cfg = dict(sparsify_cfg)
+    quantile = _coerce_quantile(
+        sparsify_cfg.get("quantile", sparsify_cfg.get("q")),
+        "sparsify.quantile",
+    )
+    min_value = _coerce_optional_float(
+        sparsify_cfg.get("min_value", sparsify_cfg.get("threshold")),
+        "sparsify.min_value",
+    )
+    return {"quantile": quantile, "min_value": min_value}
+
+
+def _normalize_rop_cfg(
+    params: Mapping[str, Any],
+    graph_cfg: Mapping[str, Any],
+) -> dict[str, Any]:
+    rop_cfg = _find_value([params, graph_cfg], ("rop", "rop_cfg", "rop_var"))
+    if rop_cfg is None:
+        rop_cfg = {}
+    if isinstance(rop_cfg, str):
+        return {"var": rop_cfg, "use_abs": True}
+    if not isinstance(rop_cfg, Mapping):
+        raise ConfigError("rop config must be a mapping or string.")
+    rop_cfg = dict(rop_cfg)
+    var_name = (
+        rop_cfg.get("var")
+        or rop_cfg.get("name")
+        or rop_cfg.get("data_var")
+        or rop_cfg.get("rop_var")
+        or "rop_net"
+    )
+    if not isinstance(var_name, str) or not var_name.strip():
+        raise ConfigError("rop.var must be a non-empty string.")
+    use_abs = rop_cfg.get("use_abs")
+    if use_abs is None:
+        use_abs = True
+    if not isinstance(use_abs, bool):
+        raise ConfigError("rop.use_abs must be a boolean.")
+    return {"var": var_name.strip(), "use_abs": use_abs}
+
+
+def _extract_reaction_map_cfg(
+    params: Mapping[str, Any],
+    graph_cfg: Mapping[str, Any],
+) -> Optional[Mapping[str, Any]]:
+    map_cfg = _find_value(
+        [params, graph_cfg],
+        ("reaction_species_map", "reaction_map", "stoich_map"),
+    )
+    if map_cfg is None:
+        return None
+    if not isinstance(map_cfg, Mapping):
+        raise ConfigError("reaction_species_map must be a mapping.")
+    return dict(map_cfg)
+
+
+def _build_reaction_map_from_cfg(
+    reaction_ids: Sequence[str],
+    species: Sequence[str],
+    map_cfg: Mapping[str, Any],
+) -> list[list[tuple[int, float]]]:
+    reaction_index = {rid: idx for idx, rid in enumerate(reaction_ids)}
+    species_index = {name: idx for idx, name in enumerate(species)}
+    reaction_map: list[list[tuple[int, float]]] = [
+        [] for _ in range(len(reaction_ids))
+    ]
+
+    for key, entry in map_cfg.items():
+        r_idx: Optional[int] = None
+        if isinstance(key, int):
+            r_idx = key
+        elif isinstance(key, str):
+            if key in reaction_index:
+                r_idx = reaction_index[key]
+            elif key.isdigit():
+                r_idx = int(key)
+        if r_idx is None or r_idx < 0 or r_idx >= len(reaction_ids):
+            raise ConfigError(f"Unknown reaction identifier in reaction_map: {key!r}.")
+        if isinstance(entry, Mapping):
+            species_entries = entry.items()
+        elif isinstance(entry, Sequence) and not isinstance(
+            entry, (str, bytes, bytearray)
+        ):
+            species_entries = [(name, 1.0) for name in entry]
+        else:
+            raise ConfigError(
+                f"reaction_map entry for {key!r} must be a mapping or sequence."
+            )
+        for species_name, coeff in species_entries:
+            if species_name not in species_index:
+                raise ConfigError(
+                    f"reaction_map species {species_name!r} not found in species list."
+                )
+            coeff_value = _coerce_float(coeff, f"reaction_map[{key}]")
+            reaction_map[r_idx].append(
+                (species_index[species_name], abs(coeff_value))
+            )
+    return reaction_map
+
+
+def _build_reaction_map_from_stoich(
+    stoich: StoichResult,
+    reaction_ids: Sequence[str],
+    species: Sequence[str],
+) -> list[list[tuple[int, float]]]:
+    reaction_index = {rid: idx for idx, rid in enumerate(reaction_ids)}
+    species_index = {name: idx for idx, name in enumerate(species)}
+    reaction_map: list[list[tuple[int, float]]] = [
+        [] for _ in range(len(reaction_ids))
+    ]
+    for s_idx, r_idx, coeff in _iter_stoich_entries(stoich):
+        if r_idx < 0 or r_idx >= len(stoich.reaction_ids):
+            continue
+        reaction_id = stoich.reaction_ids[r_idx]
+        if reaction_id not in reaction_index:
+            continue
+        target_idx = reaction_index[reaction_id]
+        species_name = stoich.species[s_idx]
+        if species_name not in species_index:
+            raise ConfigError(
+                f"Species {species_name!r} not found in run species list."
+            )
+        reaction_map[target_idx].append(
+            (species_index[species_name], abs(float(coeff)))
+        )
+    return reaction_map
+
+
+def _fallback_reaction_map(
+    reaction_ids: Sequence[str],
+    species: Sequence[str],
+) -> list[list[tuple[int, float]]]:
+    species_indices = [(idx, 1.0) for idx in range(len(species))]
+    return [list(species_indices) for _ in reaction_ids]
+
+
+def _precompute_reaction_pairs(
+    reaction_map: Sequence[Sequence[tuple[int, float]]],
+) -> list[list[tuple[int, int, float]]]:
+    pairs: list[list[tuple[int, int, float]]] = []
+    for entries in reaction_map:
+        pair_list: list[tuple[int, int, float]] = []
+        if len(entries) >= 2:
+            for i in range(len(entries)):
+                for j in range(i + 1, len(entries)):
+                    idx_i, coeff_i = entries[i]
+                    idx_j, coeff_j = entries[j]
+                    pair_list.append((idx_i, idx_j, coeff_i * coeff_j))
+        pairs.append(pair_list)
+    return pairs
+
+
+def _integrate_window_fluxes(
+    time_values: Sequence[float],
+    rop_matrix: Sequence[Sequence[float]],
+    window: TimeWindow,
+) -> list[float]:
+    if np is None:
+        raise ConfigError("numpy is required to integrate fluxes.")
+    if window.end_idx <= window.start_idx:
+        return [0.0 for _ in rop_matrix[0]]
+    times = np.asarray(time_values[window.start_idx : window.end_idx + 1], dtype=float)
+    values = np.asarray(
+        rop_matrix[window.start_idx : window.end_idx + 1], dtype=float
+    )
+    if values.ndim != 2:
+        raise ConfigError("ROP matrix must be 2D.")
+    dt = np.diff(times)
+    avg = 0.5 * (values[1:, :] + values[:-1, :])
+    return np.sum(avg * dt[:, None], axis=0).tolist()
+
+
+def _build_species_adjacency(
+    fluxes: Sequence[float],
+    reaction_pairs: Sequence[Sequence[tuple[int, int, float]]],
+    *,
+    n_species: int,
+    use_abs: bool,
+) -> Any:
+    if np is None:
+        raise ConfigError("numpy is required to build adjacency.")
+    matrix = np.zeros((n_species, n_species), dtype=float)
+    for r_idx, pairs in enumerate(reaction_pairs):
+        if not pairs:
+            continue
+        flux = float(fluxes[r_idx])
+        if use_abs:
+            flux = abs(flux)
+        if flux == 0.0:
+            continue
+        for i_idx, j_idx, weight in pairs:
+            value = flux * weight
+            matrix[i_idx, j_idx] += value
+            matrix[j_idx, i_idx] += value
+    return matrix
+
+
+def _aggregate_condition_matrices(
+    matrices: Sequence[Any],
+    *,
+    mean_weight: float,
+    p95_weight: float,
+) -> Any:
+    if np is None:
+        raise ConfigError("numpy is required for aggregation.")
+    if not matrices:
+        raise ConfigError("No matrices to aggregate.")
+    if len(matrices) == 1:
+        return np.asarray(matrices[0], dtype=float)
+    stacked = np.stack(matrices, axis=0).astype(float)
+    mean = np.mean(stacked, axis=0)
+    p95 = np.percentile(stacked, 95, axis=0)
+    return mean_weight * mean + p95_weight * p95
+
+
+def _sparsify_matrix(
+    matrix: Any,
+    *,
+    quantile: Optional[float],
+    min_value: Optional[float],
+) -> Any:
+    if np is None:
+        raise ConfigError("numpy is required for sparsification.")
+    values = np.asarray(matrix, dtype=float)
+    if values.size == 0:
+        return values
+    threshold = None
+    if quantile is not None:
+        nonzero = np.abs(values[values != 0.0])
+        if nonzero.size > 0:
+            threshold = float(np.quantile(nonzero, quantile))
+    if min_value is not None:
+        min_value = abs(float(min_value))
+        threshold = min_value if threshold is None else max(threshold, min_value)
+    if threshold is None:
+        return values
+    mask = np.abs(values) >= threshold
+    return values * mask
+
+
+def _dense_to_csr(matrix: Any) -> tuple[Any, Any, Any, tuple[int, int]]:
+    if np is None:
+        raise ConfigError("numpy is required to build CSR matrices.")
+    array = np.asarray(matrix, dtype=float)
+    if array.ndim != 2:
+        raise ConfigError("Adjacency matrix must be 2D.")
+    data: list[float] = []
+    indices: list[int] = []
+    indptr: list[int] = [0]
+    for row in array:
+        for col_idx, value in enumerate(row):
+            if value != 0.0:
+                data.append(float(value))
+                indices.append(col_idx)
+        indptr.append(len(data))
+    return (
+        np.asarray(data, dtype=float),
+        np.asarray(indices, dtype=int),
+        np.asarray(indptr, dtype=int),
+        (array.shape[0], array.shape[1]),
+    )
+
+
+def _write_csr_npz(path: Path, matrix: Any) -> None:
+    if sp is not None:
+        csr = sp.csr_matrix(matrix)
+        sp.save_npz(path, csr)
+        return
+    if np is None:
+        raise ConfigError("numpy is required to save CSR matrices.")
+    data, indices, indptr, shape = _dense_to_csr(matrix)
+    np.savez(
+        path,
+        data=data,
+        indices=indices,
+        indptr=indptr,
+        shape=np.asarray(shape, dtype=int),
+        format="csr",
+    )
+
+
 
 def _reaction_equations(solution: Any, count: int) -> list[str]:
     if count <= 0:
@@ -344,14 +1012,23 @@ def _reaction_equations(solution: Any, count: int) -> list[str]:
         equations = list(solution.reaction_equations())
         if len(equations) == count:
             return [str(entry) for entry in equations]
-    except Exception:
-        pass
+        logger.warning(
+            "Reaction equations length mismatch: expected %d, got %d.",
+            count,
+            len(equations),
+        )
+    except Exception as exc:
+        logger.warning("Reaction equations lookup failed: %s", exc)
     labels: list[str] = []
+    had_failure = False
     for idx in range(count):
         try:
             labels.append(str(solution.reaction_equation(idx)))
         except Exception:
+            had_failure = True
             labels.append(f"R{idx + 1}")
+    if had_failure:
+        logger.warning("Reaction equation lookup failed; using fallback labels.")
     return labels
 
 
@@ -962,7 +1639,10 @@ def build_bipartite_graph(
                 if key not in {"source", "target"}
             }
             graph.add_edge(source, target, **attrs)
-        return nx.readwrite.json_graph.node_link_data(graph)
+        data = nx.readwrite.json_graph.node_link_data(graph)
+        if "links" not in data and "edges" in data:
+            data["links"] = data["edges"]
+        return data
 
     return {
         "directed": True,
@@ -1225,12 +1905,36 @@ def _coerce_bool(value: Any, label: str, *, default: bool) -> bool:
     raise ConfigError(f"{label} must be a boolean.")
 
 
+def _coerce_float(value: Any, label: str) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{label} must be a float.") from exc
+
+
+def _coerce_optional_float(value: Any, label: str) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    return _coerce_float(value, label)
+
+
+def _coerce_quantile(value: Any, label: str) -> Optional[float]:
+    if value is None:
+        return None
+    quantile = _coerce_float(value, label)
+    if quantile < 0.0 or quantile > 1.0:
+        raise ConfigError(f"{label} must be between 0 and 1.")
+    return quantile
+
+
 def _load_graph_payload(path: Path) -> dict[str, Any]:
     graph_path = path / "graph.json"
     if not graph_path.exists():
         raise ConfigError(f"graph.json not found in {path}.")
     try:
-        payload = json.loads(graph_path.read_text(encoding="utf-8"))
+        payload = read_json(graph_path)
     except json.JSONDecodeError as exc:
         raise ConfigError(f"graph.json is not valid JSON: {exc}") from exc
     if not isinstance(payload, Mapping):
@@ -1737,25 +2441,23 @@ def analyze_graph(
         code=code_meta,
         exclude_keys=("hydra",),
     )
-    manifest = ArtifactManifest(
-        schema_version=1,
+    manifest = build_manifest(
         kind="graphs",
-        id=artifact_id,
-        created_at=_utc_now_iso(),
+        artifact_id=artifact_id,
         parents=[graph_id],
         inputs=inputs_payload,
         config=manifest_cfg,
         code=code_meta,
-        provenance=_provenance_metadata(),
     )
 
     def _writer(base_dir: Path) -> None:
-        (base_dir / "graph.json").write_text(
-            json.dumps(analysis_payload, ensure_ascii=True, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        write_json_atomic(base_dir / "graph.json", analysis_payload)
 
-    return store.ensure(manifest, writer=_writer)
+    result = store.ensure(manifest, writer=_writer)
+    run_root = resolve_run_root_from_store(store.root)
+    if run_root is not None:
+        sync_temporal_graph_from_artifact(result.path, run_root)
+    return result
 
 
 def run_laplacian(
@@ -1812,16 +2514,13 @@ def run_laplacian(
         code=code_meta,
         exclude_keys=("hydra",),
     )
-    manifest = ArtifactManifest(
-        schema_version=1,
+    manifest = build_manifest(
         kind="graphs",
-        id=artifact_id,
-        created_at=_utc_now_iso(),
+        artifact_id=artifact_id,
         parents=[graph_id],
         inputs=inputs_payload,
         config=manifest_cfg,
         code=code_meta,
-        provenance=_provenance_metadata(),
     )
 
     laplacian_meta: dict[str, Any] = {
@@ -1848,12 +2547,13 @@ def run_laplacian(
 
     def _writer(base_dir: Path) -> None:
         _write_laplacian_npz(base_dir / "laplacian.npz", result)
-        (base_dir / "graph.json").write_text(
-            json.dumps(laplacian_payload, ensure_ascii=True, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        write_json_atomic(base_dir / "graph.json", laplacian_payload)
 
-    return store.ensure(manifest, writer=_writer)
+    result = store.ensure(manifest, writer=_writer)
+    run_root = resolve_run_root_from_store(store.root)
+    if run_root is not None:
+        sync_temporal_graph_from_artifact(result.path, run_root)
+    return result
 
 
 def run_from_run(
@@ -1872,7 +2572,7 @@ def run_from_run(
 
     store.read_manifest("runs", run_id)
     run_dir = store.artifact_dir("runs", run_id)
-    payload = _load_run_dataset_payload(run_dir)
+    payload = load_run_dataset_payload(run_dir)
     gas_species = _extract_coord_names(payload, "species")
     surface_species = _extract_coord_names(payload, "surface_species")
     if not gas_species and not surface_species:
@@ -1903,23 +2603,625 @@ def run_from_run(
         code=_code_metadata(),
         exclude_keys=("hydra",),
     )
-    manifest = ArtifactManifest(
-        schema_version=1,
+    manifest = build_manifest(
         kind="graphs",
-        id=artifact_id,
-        created_at=_utc_now_iso(),
+        artifact_id=artifact_id,
         parents=[run_id],
         inputs=inputs_payload,
         config=manifest_cfg,
-        code=_code_metadata(),
-        provenance=_provenance_metadata(),
     )
 
     def _writer(base_dir: Path) -> None:
-        (base_dir / "graph.json").write_text(
-            json.dumps(graph_payload, ensure_ascii=True, sort_keys=True) + "\n",
-            encoding="utf-8",
+        write_json_atomic(base_dir / "graph.json", graph_payload)
+
+    result = store.ensure(manifest, writer=_writer)
+    run_root = resolve_run_root_from_store(store.root)
+    if run_root is not None:
+        sync_temporal_graph_from_artifact(result.path, run_root)
+    return result
+
+
+def run_temporal_flux(
+    cfg: Mapping[str, Any],
+    *,
+    store: ArtifactStore,
+    registry: Optional[Registry] = None,
+) -> ArtifactCacheResult:
+    """Build a temporal species graph from windowed ROP integrals."""
+    if not isinstance(cfg, Mapping):
+        raise ConfigError("cfg must be a mapping.")
+    if np is None:
+        raise ConfigError("numpy is required to build temporal flux graphs.")
+
+    resolved_cfg = _resolve_cfg(cfg)
+    manifest_cfg, graph_cfg = _extract_graph_cfg(resolved_cfg)
+    params = _extract_params(graph_cfg)
+    run_ids = _extract_run_ids(graph_cfg, params, store=store)
+    run_ids = sorted({str(run_id) for run_id in run_ids})
+    mechanism, phase = _extract_optional_mechanism(graph_cfg, params)
+    windowing_cfg = _normalize_windowing_cfg(params, graph_cfg)
+    aggregation_cfg = _normalize_aggregation_cfg(params, graph_cfg)
+    sparsify_cfg = _normalize_sparsify_cfg(params, graph_cfg)
+    rop_cfg = _normalize_rop_cfg(params, graph_cfg)
+    reaction_map_cfg = _extract_reaction_map_cfg(params, graph_cfg)
+    cache_bust = params.get("cache_bust") or params.get("cache_key") or graph_cfg.get(
+        "cache_bust"
+    )
+
+    if mechanism is None:
+        first_payload = load_run_dataset_payload(
+            store.artifact_dir("runs", run_ids[0])
         )
+        attrs = first_payload.get("attrs", {})
+        if isinstance(attrs, Mapping):
+            mech_value = attrs.get("mechanism")
+            if isinstance(mech_value, str) and mech_value.strip():
+                mechanism = mech_value.strip()
+            phase_value = attrs.get("phase")
+            if isinstance(phase_value, str) and phase_value.strip():
+                phase = phase_value.strip()
+
+    inputs_payload: dict[str, Any] = {"run_ids": list(run_ids)}
+    if mechanism is not None:
+        inputs_payload["mechanism"] = mechanism
+    if phase is not None:
+        inputs_payload["phase"] = phase
+    inputs_payload["windowing"] = {
+        "type": windowing_cfg["type"],
+        "count": windowing_cfg["count"],
+        "base": windowing_cfg["base"],
+    }
+    inputs_payload["rop"] = dict(rop_cfg)
+    inputs_payload["aggregation"] = dict(aggregation_cfg)
+    inputs_payload["sparsify"] = dict(sparsify_cfg)
+    if reaction_map_cfg is not None:
+        inputs_payload["reaction_map"] = dict(reaction_map_cfg)
+    if cache_bust is not None:
+        inputs_payload["cache_bust"] = str(cache_bust)
+
+    code_meta = _code_metadata()
+    artifact_id = make_artifact_id(
+        inputs=inputs_payload,
+        config=manifest_cfg,
+        code=code_meta,
+        exclude_keys=("hydra",),
+    )
+    manifest = build_manifest(
+        kind="graphs",
+        artifact_id=artifact_id,
+        parents=list(run_ids),
+        inputs=inputs_payload,
+        config=manifest_cfg,
+        code=code_meta,
+    )
+
+    def _writer(base_dir: Path) -> None:
+        run_payloads: list[dict[str, Any]] = []
+        for run_id in run_ids:
+            store.read_manifest("runs", run_id)
+            run_dir = store.artifact_dir("runs", run_id)
+            run_payloads.append(load_run_dataset_payload(run_dir))
+
+        build_temporal_flux_graph(
+            run_payloads=run_payloads,
+            run_ids=run_ids,
+            mechanism=mechanism,
+            phase=phase,
+            windowing_cfg=windowing_cfg,
+            aggregation_cfg=aggregation_cfg,
+            sparsify_cfg=sparsify_cfg,
+            rop_cfg=rop_cfg,
+            reaction_map_cfg=reaction_map_cfg,
+            base_dir=base_dir,
+        )
+
+    result = store.ensure(manifest, writer=_writer)
+    run_root = resolve_run_root_from_store(store.root)
+    if run_root is not None:
+        sync_temporal_graph_from_artifact(result.path, run_root)
+    return result
+
+
+def superstate_reaction_merge_batch(
+    cfg: Mapping[str, Any],
+    *,
+    store: ArtifactStore,
+    registry: Optional[Registry] = None,
+) -> ArtifactCacheResult:
+    """Aggregate reactions into "superreactions" under a superstate mapping.
+
+    The output is a GraphArtifact (graph.json) that reports, for the baseline mechanism
+    graph and for each provided reduction patch:
+      - reaction_count
+      - superreaction_exact_count (exact super-stoichiometry match)
+      - traceability mappings (reaction_index -> superreaction_id, member reactions)
+
+    This is an analysis/projection step; it does not synthesize a new kinetic model.
+    """
+    if not isinstance(cfg, Mapping):
+        raise ConfigError("cfg must be a mapping.")
+
+    resolved_cfg = _resolve_cfg(cfg)
+    manifest_cfg, graph_cfg = _extract_graph_cfg(resolved_cfg)
+    params = _extract_params(graph_cfg)
+
+    inputs = graph_cfg.get("inputs") or {}
+    if inputs is None:
+        inputs = {}
+    if not isinstance(inputs, Mapping):
+        raise ConfigError("graphs.inputs must be a mapping when provided.")
+    inputs = dict(inputs)
+
+    graph_id = inputs.get("graph_id") or inputs.get("graph") or graph_cfg.get("graph_id")
+    graph_id = _require_nonempty_str(graph_id, "inputs.graph_id")
+    mapping_id = (
+        inputs.get("mapping_id")
+        or inputs.get("mapping")
+        or inputs.get("reduction_id")
+        or graph_cfg.get("mapping_id")
+    )
+    mapping_id = _require_nonempty_str(mapping_id, "inputs.mapping_id")
+
+    patches_raw = inputs.get("patches") or inputs.get("reductions") or inputs.get("patch_ids")
+    if patches_raw is None:
+        patches_raw = []
+    if isinstance(patches_raw, str):
+        patches = [_require_nonempty_str(patches_raw, "inputs.patches")]
+    elif isinstance(patches_raw, Sequence) and not isinstance(
+        patches_raw, (str, bytes, bytearray)
+    ):
+        patches = [
+            _require_nonempty_str(item, "inputs.patches")
+            for item in patches_raw
+            if item is not None
+        ]
+    else:
+        raise ConfigError("inputs.patches must be a string or list of strings.")
+    patches = [pid for pid in patches if pid]
+
+    drop_disabled = params.get("drop_disabled")
+    if drop_disabled is None:
+        drop_disabled = True
+    if not isinstance(drop_disabled, bool):
+        raise ConfigError("params.drop_disabled must be a boolean.")
+
+    allow_mixed_reaction_type = params.get("allow_mixed_reaction_type")
+    if allow_mixed_reaction_type is None:
+        allow_mixed_reaction_type = False
+    if not isinstance(allow_mixed_reaction_type, bool):
+        raise ConfigError("params.allow_mixed_reaction_type must be a boolean.")
+
+    use_reduced_mechanism = params.get("use_reduced_mechanism") or "auto"
+    if not isinstance(use_reduced_mechanism, str) or not use_reduced_mechanism.strip():
+        raise ConfigError("params.use_reduced_mechanism must be a string.")
+    use_reduced_mechanism = use_reduced_mechanism.strip().lower()
+    if use_reduced_mechanism not in {"auto", "always", "never"}:
+        raise ConfigError("params.use_reduced_mechanism must be one of: auto, always, never.")
+
+    include_kinetics_dispersion = params.get("include_kinetics_dispersion")
+    if include_kinetics_dispersion is None:
+        include_kinetics_dispersion = False
+    if not isinstance(include_kinetics_dispersion, bool):
+        raise ConfigError("params.include_kinetics_dispersion must be a boolean.")
+    if include_kinetics_dispersion and ct is None:  # pragma: no cover - optional dependency
+        raise ConfigError("include_kinetics_dispersion requires cantera to be installed.")
+
+    def _load_mapping() -> dict[str, int]:
+        store.read_manifest("reduction", mapping_id)
+        base_dir = store.artifact_dir("reduction", mapping_id)
+        path = base_dir / "mapping.json"
+        if not path.exists():
+            path = base_dir / "node_lumping.json"
+        if not path.exists():
+            raise ConfigError(f"Expected mapping.json or node_lumping.json for reduction/{mapping_id}.")
+        payload = read_json(path)
+        if not isinstance(payload, Mapping):
+            raise ConfigError("mapping payload must be a JSON object.")
+        mapping_raw = payload.get("mapping") or []
+        if not isinstance(mapping_raw, Sequence) or isinstance(mapping_raw, (str, bytes, bytearray)):
+            raise ConfigError("mapping payload must include a mapping list.")
+        mapping_by_name: dict[str, int] = {}
+        for entry in mapping_raw:
+            if not isinstance(entry, Mapping):
+                continue
+            species = entry.get("species")
+            if not isinstance(species, str) or not species.strip():
+                continue
+            if "superstate_id" in entry:
+                sid = entry.get("superstate_id")
+            else:
+                sid = entry.get("cluster_id")
+            try:
+                sid_int = int(sid)
+            except (TypeError, ValueError):
+                continue
+            mapping_by_name[species.strip()] = sid_int
+        if not mapping_by_name:
+            raise ConfigError("mapping payload produced no species->superstate entries.")
+        return mapping_by_name
+
+    mapping_by_name = _load_mapping()
+
+    def _disabled_indices_from_patch(patch: Mapping[str, Any]) -> set[int]:
+        disabled: set[int] = set()
+        disabled_raw = patch.get("disabled_reactions") or []
+        if isinstance(disabled_raw, Mapping):
+            disabled_raw = [disabled_raw]
+        if isinstance(disabled_raw, Sequence) and not isinstance(
+            disabled_raw, (str, bytes, bytearray)
+        ):
+            for entry in disabled_raw:
+                if not isinstance(entry, Mapping):
+                    continue
+                idx = entry.get("index")
+                if isinstance(idx, bool) or idx is None:
+                    continue
+                try:
+                    disabled.add(int(idx))
+                except (TypeError, ValueError):
+                    continue
+        multipliers_raw = patch.get("reaction_multipliers") or []
+        if isinstance(multipliers_raw, Mapping):
+            multipliers_raw = [multipliers_raw]
+        if isinstance(multipliers_raw, Sequence) and not isinstance(
+            multipliers_raw, (str, bytes, bytearray)
+        ):
+            for entry in multipliers_raw:
+                if not isinstance(entry, Mapping):
+                    continue
+                idx = entry.get("index")
+                if isinstance(idx, bool) or idx is None:
+                    continue
+                try:
+                    multiplier = float(entry.get("multiplier", 1.0))
+                except (TypeError, ValueError):
+                    continue
+                if multiplier == 0.0:
+                    try:
+                        disabled.add(int(idx))
+                    except (TypeError, ValueError):
+                        continue
+        return disabled
+
+    def _species_name(node: Mapping[str, Any]) -> str:
+        for key in ("label", "species", "name"):
+            value = node.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        node_id = node.get("id")
+        if isinstance(node_id, str) and node_id.startswith("species_"):
+            trimmed = node_id[len("species_") :]
+            return trimmed if trimmed else node_id
+        return str(node.get("id", "unknown"))
+
+    def _canonical_coeff(value: float) -> float:
+        if abs(value) < 1e-15:
+            return 0.0
+        rounded = round(float(value))
+        if abs(float(value) - rounded) < 1e-12:
+            return float(int(rounded))
+        return float(round(float(value), 12))
+
+    def _signature_id(signature: Mapping[str, Any]) -> str:
+        return stable_hash(signature, length=16)
+
+    def _group_from_stoich_entries(
+        *,
+        species_names: Sequence[str],
+        reaction_count: int,
+        entries: Sequence[tuple[int, int, float]],
+        reaction_types: Optional[Mapping[int, str]] = None,
+        reaction_equations: Optional[Sequence[str]] = None,
+        reaction_ids: Optional[Sequence[str]] = None,
+    ) -> dict[str, Any]:
+        stoich_by_rxn: list[dict[int, float]] = [dict() for _ in range(reaction_count)]
+        for s_idx, r_idx, value in entries:
+            if r_idx < 0 or r_idx >= reaction_count:
+                continue
+            if s_idx < 0 or s_idx >= len(species_names):
+                continue
+            species = str(species_names[s_idx])
+            sid = mapping_by_name.get(species)
+            if sid is None:
+                raise ConfigError(f"Species {species!r} missing from mapping_id={mapping_id}.")
+            cur = stoich_by_rxn[r_idx].get(int(sid), 0.0)
+            stoich_by_rxn[r_idx][int(sid)] = cur + float(value)
+
+        reaction_to_superreaction: list[str] = []
+        superreactions: dict[str, dict[str, Any]] = {}
+        for r_idx in range(reaction_count):
+            vec = stoich_by_rxn[r_idx]
+            items = [
+                (int(sid), _canonical_coeff(coeff))
+                for sid, coeff in vec.items()
+                if _canonical_coeff(coeff) != 0.0
+            ]
+            items.sort(key=lambda pair: pair[0])
+            rtype = None
+            if not allow_mixed_reaction_type and reaction_types is not None:
+                rtype = reaction_types.get(r_idx) or "unknown"
+            signature_obj: dict[str, Any] = {"stoich": items}
+            if rtype is not None:
+                signature_obj["reaction_type"] = str(rtype)
+            srid = _signature_id(signature_obj)
+            reaction_to_superreaction.append(srid)
+            info = superreactions.get(srid)
+            if info is None:
+                info = {
+                    "superreaction_id": srid,
+                    "signature": signature_obj,
+                    "members": [],
+                }
+                superreactions[srid] = info
+            member = {
+                "reaction_index": int(r_idx),
+            }
+            if reaction_ids is not None and r_idx < len(reaction_ids):
+                member["reaction_id"] = str(reaction_ids[r_idx])
+            if reaction_equations is not None and r_idx < len(reaction_equations):
+                member["reaction_equation"] = str(reaction_equations[r_idx])
+            if reaction_types is not None and r_idx in reaction_types:
+                member["reaction_type"] = str(reaction_types[r_idx])
+            info["members"].append(member)
+
+        group_sizes = [len(info.get("members") or []) for info in superreactions.values()]
+        group_sizes.sort()
+        return {
+            "reaction_indices": [int(idx) for idx in range(reaction_count)],
+            "reaction_count": int(reaction_count),
+            "superreaction_exact_count": int(len(superreactions)),
+            "reaction_to_superreaction": reaction_to_superreaction,
+            "superreactions": list(superreactions.values()),
+            "group_size_summary": {
+                "count": int(len(group_sizes)),
+                "min": int(group_sizes[0]) if group_sizes else 0,
+                "max": int(group_sizes[-1]) if group_sizes else 0,
+                "mean": float(sum(group_sizes) / len(group_sizes)) if group_sizes else 0.0,
+                "p50": int(group_sizes[len(group_sizes) // 2]) if group_sizes else 0,
+            },
+        }
+
+    # Baseline: use the provided stoichiometric graph artifact.
+    store.read_manifest("graphs", graph_id)
+    graph_dir = store.artifact_dir("graphs", graph_id)
+    payload = _load_graph_payload(graph_dir)
+    graph_data, _ = _extract_node_link_payload(payload)
+    nodes_raw = graph_data.get("nodes") or []
+    links_raw = graph_data.get("links") or graph_data.get("edges") or []
+    nodes, node_map = _normalize_nodes(nodes_raw)
+    links = _normalize_links(links_raw)
+
+    species_node_to_name: dict[str, str] = {}
+    reaction_node_to_index: dict[str, int] = {}
+    reaction_type_by_index: dict[int, str] = {}
+    reaction_equation_by_index: dict[int, str] = {}
+    reaction_id_by_index: dict[int, str] = {}
+    for node in nodes:
+        node_id = node.get("id")
+        if not isinstance(node_id, str):
+            continue
+        kind = node.get("kind")
+        if kind == "species":
+            species_node_to_name[node_id] = _species_name(node)
+        elif kind == "reaction":
+            idx = node.get("reaction_index")
+            if isinstance(idx, bool) or idx is None:
+                continue
+            try:
+                idx_int = int(idx)
+            except (TypeError, ValueError):
+                continue
+            reaction_node_to_index[node_id] = idx_int
+            rtype = node.get("reaction_type") or node.get("type") or "unknown"
+            reaction_type_by_index[idx_int] = str(rtype)
+            eq = node.get("reaction_equation") or node.get("equation")
+            if isinstance(eq, str) and eq.strip():
+                reaction_equation_by_index[idx_int] = eq.strip()
+            rid = node.get("reaction_id") or node.get("reaction")
+            if isinstance(rid, str) and rid.strip():
+                reaction_id_by_index[idx_int] = rid.strip()
+
+    if not reaction_type_by_index:
+        raise ConfigError("Baseline graph has no reaction_index metadata.")
+    baseline_reaction_count = max(reaction_type_by_index.keys()) + 1
+    baseline_species_names: list[str] = []
+    # Preserve stable ordering by species_index if present.
+    species_entries = [
+        (node.get("species_index"), node_id, name)
+        for node_id, name in species_node_to_name.items()
+        for node in [node_map.get(node_id, {})]
+    ]
+    species_entries.sort(key=lambda item: (item[0] if isinstance(item[0], int) else 1_000_000, str(item[2]).lower()))
+    baseline_species_names = [name for _, _, name in species_entries]
+    species_index_by_node_id = {node_id: idx for idx, (_, node_id, _) in enumerate(species_entries)}
+
+    # Convert bipartite links into (species_index, reaction_index, stoich) entries.
+    stoich_entries: list[tuple[int, int, float]] = []
+    for link in links:
+        source = _coerce_node_ref(link.get("source"))
+        target = _coerce_node_ref(link.get("target"))
+        if source is None or target is None:
+            continue
+        s_node = None
+        r_node = None
+        if source in species_node_to_name and target in reaction_node_to_index:
+            s_node = source
+            r_node = target
+        elif target in species_node_to_name and source in reaction_node_to_index:
+            s_node = target
+            r_node = source
+        if s_node is None or r_node is None:
+            continue
+        s_idx = species_index_by_node_id.get(s_node)
+        r_idx = reaction_node_to_index.get(r_node)
+        if s_idx is None or r_idx is None:
+            continue
+        stoich = link.get("stoich")
+        if stoich is None:
+            continue
+        try:
+            value = float(stoich)
+        except (TypeError, ValueError):
+            continue
+        if value == 0.0:
+            continue
+        stoich_entries.append((int(s_idx), int(r_idx), float(value)))
+
+    baseline_reaction_ids = [reaction_id_by_index.get(i, f"R{i+1}") for i in range(baseline_reaction_count)]
+    baseline_equations = [reaction_equation_by_index.get(i, "") for i in range(baseline_reaction_count)]
+    baseline_group = _group_from_stoich_entries(
+        species_names=baseline_species_names,
+        reaction_count=baseline_reaction_count,
+        entries=stoich_entries,
+        reaction_types=reaction_type_by_index,
+        reaction_equations=baseline_equations,
+        reaction_ids=baseline_reaction_ids,
+    )
+    baseline_group["graph_id"] = graph_id
+
+    patches_out: list[dict[str, Any]] = []
+    for reduction_id in patches:
+        store.read_manifest("reduction", reduction_id)
+        red_dir = store.artifact_dir("reduction", reduction_id)
+        patch_path = red_dir / "mechanism_patch.yaml"
+        patch_payload: Optional[dict[str, Any]] = None
+        if patch_path.exists():
+            raw = _read_mech_yaml_payload(patch_path)
+            if isinstance(raw, Mapping):
+                patch_payload = dict(raw)
+        disabled_indices = _disabled_indices_from_patch(patch_payload or {})
+        is_state_merge = bool(isinstance(patch_payload, Mapping) and patch_payload.get("state_merge"))
+
+        mechanism_path = red_dir / "mechanism.yaml"
+        use_reduced = False
+        if use_reduced_mechanism == "always":
+            use_reduced = mechanism_path.exists() and ct is not None
+        elif use_reduced_mechanism == "never":
+            use_reduced = False
+        else:
+            # auto: use reduced mechanism when a state-merge patch changes stoichiometry.
+            use_reduced = bool(is_state_merge and mechanism_path.exists() and ct is not None)
+
+        if use_reduced:
+            solution = ct.Solution(str(mechanism_path))
+            stoich = build_stoich(solution)
+            reaction_annotations = annotate_reactions(solution)
+            types_by_index = {
+                int(meta.get("reaction_index")): str(meta.get("reaction_type", "unknown"))
+                for meta in reaction_annotations.values()
+                if isinstance(meta, Mapping) and meta.get("reaction_index") is not None
+            }
+            entries = _iter_stoich_entries(stoich)
+            grouped = _group_from_stoich_entries(
+                species_names=stoich.species,
+                reaction_count=len(stoich.reaction_ids),
+                entries=entries,
+                reaction_types=types_by_index,
+                reaction_equations=stoich.reaction_equations,
+                reaction_ids=stoich.reaction_ids,
+            )
+            mode = "reduced_mechanism"
+            reaction_count_after = int(grouped["reaction_count"])
+        else:
+            # Fast path: filter baseline reactions by disabled indices.
+            remaining = [
+                idx for idx in range(baseline_reaction_count) if idx not in disabled_indices
+            ] if drop_disabled else list(range(baseline_reaction_count))
+
+            # Build superreaction groups by reusing baseline reaction_to_superreaction.
+            baseline_map = baseline_group.get("reaction_to_superreaction") or []
+            kept_super: dict[str, list[int]] = {}
+            for idx in remaining:
+                if idx < 0 or idx >= len(baseline_map):
+                    continue
+                srid = baseline_map[idx]
+                kept_super.setdefault(str(srid), []).append(int(idx))
+            superreactions = []
+            for srid, members in kept_super.items():
+                superreactions.append(
+                    {
+                        "superreaction_id": srid,
+                        "members": [{"reaction_index": int(m)} for m in members],
+                    }
+                )
+            grouped = {
+                "reaction_indices": [int(idx) for idx in remaining],
+                "reaction_count": int(len(remaining)),
+                "superreaction_exact_count": int(len(kept_super)),
+                "reaction_to_superreaction": [
+                    str(baseline_map[idx]) for idx in remaining if idx < len(baseline_map)
+                ],
+                "superreactions": superreactions,
+                "group_size_summary": {
+                    "count": int(len(kept_super)),
+                    "min": int(min((len(v) for v in kept_super.values()), default=0)),
+                    "max": int(max((len(v) for v in kept_super.values()), default=0)),
+                    "mean": float(
+                        sum(len(v) for v in kept_super.values()) / len(kept_super)
+                    ) if kept_super else 0.0,
+                    "p50": 0,
+                },
+            }
+            mode = "drop_disabled" if drop_disabled else "baseline"
+            reaction_count_after = int(grouped["reaction_count"])
+
+        patch_entry: dict[str, Any] = {
+            "reduction_id": reduction_id,
+            "mode": mode,
+            "disabled_reactions": int(len(disabled_indices)),
+            "reactions_after": reaction_count_after,
+            "superreaction_exact_count": int(grouped.get("superreaction_exact_count") or 0),
+            "group_size_summary": grouped.get("group_size_summary") or {},
+        }
+        # Traceability: always keep a reaction->superreaction mapping and the member lists.
+        patch_entry["reaction_indices"] = grouped.get("reaction_indices")
+        patch_entry["reaction_to_superreaction"] = grouped.get("reaction_to_superreaction") or []
+        patch_entry["superreactions"] = grouped.get("superreactions") or []
+        patches_out.append(patch_entry)
+
+    output_payload = {
+        "schema_version": 1,
+        "kind": "superstate_reaction_merge_batch",
+        "source": {"graph_id": graph_id, "mapping_id": mapping_id},
+        "params": {
+            "drop_disabled": drop_disabled,
+            "allow_mixed_reaction_type": allow_mixed_reaction_type,
+            "use_reduced_mechanism": use_reduced_mechanism,
+            "include_kinetics_dispersion": include_kinetics_dispersion,
+        },
+        "baseline": {
+            "reaction_count": baseline_group["reaction_count"],
+            "superreaction_exact_count": baseline_group["superreaction_exact_count"],
+            "group_size_summary": baseline_group.get("group_size_summary"),
+            "reaction_to_superreaction": baseline_group.get("reaction_to_superreaction") or [],
+            "superreactions": baseline_group.get("superreactions") or [],
+        },
+        "patches": patches_out,
+    }
+
+    inputs_payload = {
+        "graph_id": graph_id,
+        "mapping_id": mapping_id,
+        "patches": patches,
+        "params": output_payload["params"],
+    }
+    artifact_id = make_artifact_id(
+        inputs=inputs_payload,
+        config=manifest_cfg,
+        code=_code_metadata(),
+        exclude_keys=("hydra",),
+    )
+    parents = [graph_id, mapping_id] + list(patches)
+    manifest = build_manifest(
+        kind="graphs",
+        artifact_id=artifact_id,
+        parents=list(dict.fromkeys(parents)),
+        inputs=inputs_payload,
+        config=manifest_cfg,
+    )
+
+    def _writer(base_dir: Path) -> None:
+        write_json_atomic(base_dir / "graph.json", output_payload)
 
     return store.ensure(manifest, writer=_writer)
 
@@ -1958,16 +3260,11 @@ def run(
         code=_code_metadata(),
         exclude_keys=("hydra",),
     )
-    manifest = ArtifactManifest(
-        schema_version=1,
+    manifest = build_manifest(
         kind="graphs",
-        id=artifact_id,
-        created_at=_utc_now_iso(),
-        parents=[],
+        artifact_id=artifact_id,
         inputs=inputs_payload,
         config=manifest_cfg,
-        code=_code_metadata(),
-        provenance=_provenance_metadata(),
     )
 
     metadata = _graph_metadata(
@@ -1979,10 +3276,7 @@ def run(
 
     def _writer(base_dir: Path) -> None:
         _write_stoich_npz(base_dir / "stoich.npz", result)
-        (base_dir / "graph.json").write_text(
-            json.dumps(metadata, ensure_ascii=True, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        write_json_atomic(base_dir / "graph.json", metadata)
 
     return store.ensure(manifest, writer=_writer)
 
@@ -1992,6 +3286,8 @@ register("task", "graphs.analyze", analyze_graph)
 register("task", "graphs.analytics", analyze_graph)
 register("task", "graphs.laplacian", run_laplacian)
 register("task", "graphs.from_run", run_from_run)
+register("task", "graphs.temporal_flux", run_temporal_flux)
+register("task", "graphs.superstate_reaction_merge_batch", superstate_reaction_merge_batch)
 
 __all__ = [
     "LaplacianResult",
@@ -2004,5 +3300,7 @@ __all__ = [
     "build_laplacian",
     "run_from_run",
     "run_laplacian",
+    "run_temporal_flux",
+    "superstate_reaction_merge_batch",
     "run",
 ]

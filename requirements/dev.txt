@@ -1,0 +1,4 @@
+# Development extras
+-r requirements/benchmarks.txt
+pytest
+pytest-cov

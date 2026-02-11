@@ -17,7 +17,7 @@ def _config_dir() -> Path:
 def test_hydra_compose_defaults() -> None:
     cfg = compose_config(
         config_path=_config_dir(),
-        config_name="defaults",
+        config_name="default",
         overrides=["sim=placeholder", "task=placeholder", "pipeline=placeholder"],
     )
     resolved = resolve_config(cfg)
@@ -30,7 +30,7 @@ def test_hydra_compose_defaults() -> None:
 
 
 def test_seed_and_manifest_attachment() -> None:
-    cfg = compose_config(config_path=_config_dir(), config_name="defaults")
+    cfg = compose_config(config_path=_config_dir(), config_name="default")
     seed = seed_everything(cfg)
     assert seed == 0
     manifest = ArtifactManifest(

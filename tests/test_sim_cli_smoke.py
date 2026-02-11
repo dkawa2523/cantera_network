@@ -98,7 +98,7 @@ def test_sim_validate_cli_reports_error(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[1]
     config_dir = tmp_path / "configs"
     config_dir.mkdir(parents=True, exist_ok=True)
-    (config_dir / "defaults.yaml").write_text("defaults:\n  - _self_\n", encoding="utf-8")
+    (config_dir / "default.yaml").write_text("defaults:\n  - _self_\n", encoding="utf-8")
 
     result = _run_cli(
         "sim",
@@ -106,7 +106,7 @@ def test_sim_validate_cli_reports_error(tmp_path: Path) -> None:
         "--config-path",
         str(config_dir),
         "--config-name",
-        "defaults",
+        "default",
         cwd=repo_root,
     )
     assert result.returncode != 0

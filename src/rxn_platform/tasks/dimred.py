@@ -3,23 +3,24 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timezone
 import json
 import logging
 import math
-import platform
 from pathlib import Path
-import subprocess
 from typing import Any, Optional
-
-from rxn_platform import __version__
-from rxn_platform.core import ArtifactManifest, make_artifact_id
+from rxn_platform.core import make_artifact_id
 from rxn_platform.errors import ConfigError
-from rxn_platform.hydra_utils import resolve_config
+from rxn_platform.io_utils import write_json_atomic
 from rxn_platform.registry import Registry, register
 from rxn_platform.store import ArtifactCacheResult, ArtifactStore
 from rxn_platform.tasks.base import Task
 from rxn_platform.tasks.runner import run_task
+from rxn_platform.tasks.common import (
+    build_manifest,
+    code_metadata as _code_metadata,
+    read_table_rows as _read_table_rows,
+    resolve_cfg as _resolve_cfg,
+)
 
 try:  # Optional dependency.
     import pandas as pd
@@ -51,21 +52,6 @@ REQUIRED_COLUMNS = (
     "variance_ratio",
     "meta_json",
 )
-
-
-def _utc_now_iso() -> str:
-    timestamp = datetime.now(timezone.utc).replace(microsecond=0)
-    return timestamp.isoformat().replace("+00:00", "Z")
-
-
-def _resolve_cfg(cfg: Any) -> dict[str, Any]:
-    try:
-        resolved = resolve_config(cfg)
-    except ConfigError:
-        if isinstance(cfg, Mapping):
-            return dict(cfg)
-        raise
-    return resolved
 
 
 def _extract_dimred_cfg(
@@ -207,23 +193,6 @@ def _extract_sensitivity_cfg(
                 return None
             return dict(value)
     return None
-
-
-def _read_table_rows(path: Path) -> list[dict[str, Any]]:
-    if pd is not None:
-        try:
-            frame = pd.read_parquet(path)
-            return frame.to_dict(orient="records")
-        except Exception:
-            pass
-    if pq is not None:
-        try:
-            table = pq.read_table(path)
-            return table.to_pylist()
-        except Exception:
-            pass
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    return list(payload.get("rows", []))
 
 
 def _coerce_numeric(value: Any) -> Optional[float]:
@@ -452,42 +421,12 @@ def _write_subspace_table(rows: Sequence[Mapping[str, Any]], path: Path) -> None
         pq.write_table(table, path)
         return
     payload = {"columns": columns, "rows": list(rows)}
-    path.write_text(
-        json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    write_json_atomic(path, payload)
     logger = logging.getLogger("rxn_platform.dimred")
     logger.warning(
         "Parquet writer unavailable; stored JSON payload at %s.",
         path,
     )
-
-
-def _code_metadata() -> dict[str, Any]:
-    payload: dict[str, Any] = {"version": __version__}
-    git_dir = Path.cwd() / ".git"
-    if not git_dir.exists():
-        return payload
-    try:
-        commit = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
-        payload["git_commit"] = commit
-        dirty = subprocess.check_output(
-            ["git", "status", "--porcelain"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
-        payload["dirty"] = bool(dirty)
-    except (OSError, subprocess.SubprocessError):
-        return payload
-    return payload
-
-
-def _provenance_metadata() -> dict[str, Any]:
-    return {"python": platform.python_version()}
 
 
 def _resolve_sensitivity_artifact(
@@ -635,16 +574,12 @@ def run(
         exclude_keys=("hydra",),
     )
 
-    manifest = ArtifactManifest(
-        schema_version=1,
+    manifest = build_manifest(
         kind="subspaces",
-        id=artifact_id,
-        created_at=_utc_now_iso(),
+        artifact_id=artifact_id,
         parents=[sensitivity_id],
         inputs=inputs_payload,
         config=manifest_cfg,
-        code=_code_metadata(),
-        provenance=_provenance_metadata(),
     )
 
     def _writer(base_dir: Path) -> None:

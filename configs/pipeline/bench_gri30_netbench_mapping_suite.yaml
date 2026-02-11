@@ -1,0 +1,100 @@
+# NetBench: mapping-style reductions + mapping evaluation
+steps:
+  - id: sim
+    task: sim.run_csv
+    sim: ${sim}
+    params:
+      conditions_file: ${benchmarks.conditions_file}
+      case_id: ${benchmarks.case_id}
+
+  - id: graph_mech
+    task: graphs.stoich
+    graphs:
+      mechanism: ${mechanism.path}
+    params: {}
+
+  - id: graph_flux
+    task: graphs.temporal_flux
+    inputs:
+      run_id: "@sim"
+      mechanism: ${mechanism.path}
+    params: {}
+
+  - id: cnr
+    task: reduction.dispatch
+    method: cnr_coarse
+    inputs:
+      graph_id: "@graph_flux"
+    params:
+      constraints:
+        fields: [phase, charge]
+      community:
+        method: louvain
+        resolution: 1.0
+        min_weight: 0.0
+        symmetrize: true
+
+  - id: gnn_pool
+    task: reduction.gnn_pool_temporal
+    inputs:
+      graph_id: "@graph_flux"
+    params:
+      constraints:
+        fields: [phase, charge]
+      pool:
+        k_sweep: [8, 10, 12, 15, 20]
+        symmetrize: true
+      temporal:
+        time_dim: 8
+        message_passing: 1
+      selection:
+        coverage_slack: 0.02
+
+  - id: mapping_eval
+    task: reduction.evaluate_mapping
+    inputs:
+      gnn:
+        mapping_id: "@gnn_pool"
+        graph_id: "@graph_flux"
+      compare:
+        mapping_id: "@cnr"
+        graph_id: "@graph_flux"
+    params:
+      qoi:
+        selector: all
+        window_radius: 1
+      report:
+        format: markdown
+
+  - id: node_lumping
+    task: reduction.node_lumping
+    inputs:
+      graph_id: "@graph_mech"
+    lumping:
+      method: threshold
+      threshold: 0.95
+      weights:
+        elements: 0.7
+        charge: 0.2
+        phase: 0.1
+        state: 0.0
+      charge_scale: 2.0
+      representative:
+        metric: degree
+
+  - id: reaction_lumping
+    task: reduction.reaction_lumping
+    inputs:
+      graph_id: "@graph_mech"
+    lumping:
+      method: threshold
+      threshold: 0.8
+      similarity:
+        metric: jaccard
+        mode: union
+        weights:
+          reactants: 0.5
+          products: 0.5
+        include_participants: false
+      representative:
+        metric: degree

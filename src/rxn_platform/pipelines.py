@@ -3,20 +3,19 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timezone
-import json
 import logging
-import platform
 from pathlib import Path
-import subprocess
 import time
 from typing import Any, Optional
 
-from rxn_platform import __version__
-from rxn_platform.core import ArtifactManifest, load_config, make_run_id
+from rxn_platform.core import load_config, make_run_id
 from rxn_platform.errors import ConfigError, TaskError
+from rxn_platform.hydra_utils import seed_everything
+from rxn_platform.io_utils import write_json_atomic
+from rxn_platform.run_store import utc_now_iso
 from rxn_platform.registry import Registry
 from rxn_platform.store import ArtifactStore
+from rxn_platform.tasks.common import build_manifest
 from rxn_platform.tasks.runner import DEFAULT_STORE_ROOT, run_task
 
 DEFAULT_PIPELINE_ROOT = Path("configs") / "pipeline"
@@ -41,40 +40,12 @@ def _as_steps(value: Any) -> list[dict[str, Any]]:
 
 def _extract_pipeline_cfg(cfg: Mapping[str, Any]) -> dict[str, Any]:
     if "pipeline" in cfg and isinstance(cfg.get("pipeline"), Mapping):
-        return dict(cfg["pipeline"])
+        pipeline_cfg = dict(cfg["pipeline"])
+        common_cfg = cfg.get("common")
+        if isinstance(common_cfg, Mapping) and "common" not in pipeline_cfg:
+            pipeline_cfg["common"] = dict(common_cfg)
+        return pipeline_cfg
     return dict(cfg)
-
-
-def _utc_now_iso() -> str:
-    timestamp = datetime.now(timezone.utc).replace(microsecond=0)
-    return timestamp.isoformat().replace("+00:00", "Z")
-
-
-def _code_metadata() -> dict[str, Any]:
-    payload: dict[str, Any] = {"version": __version__}
-    git_dir = Path.cwd() / ".git"
-    if not git_dir.exists():
-        return payload
-    try:
-        commit = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
-        payload["git_commit"] = commit
-        dirty = subprocess.check_output(
-            ["git", "status", "--porcelain"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
-        payload["dirty"] = bool(dirty)
-    except (OSError, subprocess.SubprocessError):
-        return payload
-    return payload
-
-
-def _provenance_metadata() -> dict[str, Any]:
-    return {"python": platform.python_version()}
 
 
 def _resolve_step_ref(
@@ -204,30 +175,30 @@ class PipelineRunner:
         else:
             raw_cfg = self.load(pipeline)
         pipeline_cfg = _extract_pipeline_cfg(raw_cfg)
+        seed_everything(pipeline_cfg)
         steps = _as_steps(pipeline_cfg.get("steps"))
 
         pipeline_run_id = make_run_id(pipeline_cfg, exclude_keys=("hydra",))
-        pipeline_manifest = ArtifactManifest(
-            schema_version=1,
+        pipeline_manifest = build_manifest(
             kind="pipelines",
-            id=pipeline_run_id,
-            created_at=_utc_now_iso(),
-            parents=[],
-            inputs={},
+            artifact_id=pipeline_run_id,
             config=pipeline_cfg,
-            code=_code_metadata(),
-            provenance=_provenance_metadata(),
         )
 
         results: dict[str, str] = {}
         step_records: list[dict[str, Any]] = []
         seen: set[str] = set()
         last_result: Optional[str] = None
+        common_cfg: Optional[dict[str, Any]] = None
+        if isinstance(pipeline_cfg.get("common"), Mapping):
+            common_cfg = dict(pipeline_cfg["common"])
         for index, step in enumerate(steps):
             step_id, task_name, step_cfg = _normalize_step(step, index)
             if step_id in seen:
                 raise ConfigError(f"Duplicate pipeline step id: {step_id!r}.")
             seen.add(step_id)
+            if common_cfg is not None and "common" not in step_cfg:
+                step_cfg["common"] = dict(common_cfg)
             resolved_inputs = _resolve_step_ref(
                 step_cfg["inputs"],
                 results=results,
@@ -236,7 +207,7 @@ class PipelineRunner:
             )
             step_cfg["inputs"] = resolved_inputs
             self.logger.info("Running pipeline step %s (%s).", step_id, task_name)
-            started_at = _utc_now_iso()
+            started_at = utc_now_iso()
             start_clock = time.perf_counter()
             try:
                 result = run_task(
@@ -251,7 +222,7 @@ class PipelineRunner:
                     f"Pipeline step {step_id!r} failed: {exc}",
                     context={"step": step_id, "task": task_name},
                 ) from exc
-            ended_at = _utc_now_iso()
+            ended_at = utc_now_iso()
             elapsed = time.perf_counter() - start_clock
             artifact_id = result.manifest.id
             results[step_id] = artifact_id
@@ -275,16 +246,7 @@ class PipelineRunner:
         }
 
         def _writer(base_dir: Path) -> None:
-            payload = json.dumps(
-                results_payload,
-                indent=2,
-                sort_keys=True,
-                ensure_ascii=True,
-            )
-            (base_dir / "results.json").write_text(
-                f"{payload}\n",
-                encoding="utf-8",
-            )
+            write_json_atomic(base_dir / "results.json", results_payload)
 
         self.store.ensure(pipeline_manifest, writer=_writer)
         return results

@@ -14,8 +14,8 @@ def test_stable_hash_list_tuple_equivalence() -> None:
 
 
 def test_stable_hash_path_and_numbers() -> None:
-    cfg = {"path": Path("configs/defaults.yaml"), "seed": 123}
-    assert stable_hash(cfg) == stable_hash({"path": "configs/defaults.yaml", "seed": 123})
+    cfg = {"path": Path("configs/default.yaml"), "seed": 123}
+    assert stable_hash(cfg) == stable_hash({"path": "configs/default.yaml", "seed": 123})
     assert stable_hash({"value": 1}) != stable_hash({"value": 2})
 
 

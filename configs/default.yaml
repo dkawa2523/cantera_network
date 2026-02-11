@@ -1,0 +1,16 @@
+defaults:
+  - schema: base
+  - sim: dummy
+  - task: sim_run
+  - pipeline: smoke
+  - recipe: smoke
+  - _self_
+
+hydra:
+  run:
+    dir: ${run.root}/hydra
+  sweep:
+    dir: ${run.root}/hydra
+    subdir: ${hydra.job.num}
+  job:
+    chdir: false

@@ -1,0 +1,11 @@
+# @package _global_
+defaults:
+  - override /sim: dummy
+  - override /task: sim_run
+  - override /pipeline: smoke
+  - _self_
+
+recipe:
+  name: sim_sweep
+  description: Placeholder sim sweep recipe (uses smoke pipeline for now).
+  notes: "TODO: replace with CSV sweep pipeline when sim.sweep_csv is implemented."

@@ -4,21 +4,24 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
-import json
 import logging
 import math
-import platform
+import random
 from pathlib import Path
-import subprocess
 from typing import Any, Optional
-
-from rxn_platform import __version__
-from rxn_platform.core import ArtifactManifest, make_artifact_id
+from rxn_platform.core import make_artifact_id
 from rxn_platform.errors import ArtifactError, ConfigError
-from rxn_platform.hydra_utils import resolve_config
+from rxn_platform.io_utils import read_json, write_json_atomic
 from rxn_platform.registry import Registry, register
+from rxn_platform.run_store import utc_now_iso
 from rxn_platform.store import ArtifactCacheResult, ArtifactStore
+from rxn_platform.tasks.common import (
+    build_manifest,
+    code_metadata as _code_metadata,
+    load_run_dataset_payload,
+    load_run_ids_from_run_set,
+    resolve_cfg as _resolve_cfg,
+)
 
 try:  # Optional dependency.
     import numpy as np
@@ -38,9 +41,9 @@ except ImportError:  # pragma: no cover - optional dependency
     pq = None
 
 try:  # Optional dependency.
-    import xarray as xr
+    import scipy.sparse as sp
 except ImportError:  # pragma: no cover - optional dependency
-    xr = None
+    sp = None
 
 DEFAULT_NODE_KINDS = ("species",)
 DEFAULT_MISSING_STRATEGY = "nan"
@@ -60,48 +63,6 @@ class NodeFeatureSpec:
     name: str
     data_var: str
     coord: Optional[str]
-
-
-def _utc_now_iso() -> str:
-    timestamp = datetime.now(timezone.utc).replace(microsecond=0)
-    return timestamp.isoformat().replace("+00:00", "Z")
-
-
-def _code_metadata() -> dict[str, Any]:
-    payload: dict[str, Any] = {"version": __version__}
-    git_dir = Path.cwd() / ".git"
-    if not git_dir.exists():
-        return payload
-    try:
-        commit = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
-        payload["git_commit"] = commit
-        dirty = subprocess.check_output(
-            ["git", "status", "--porcelain"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
-        payload["dirty"] = bool(dirty)
-    except (OSError, subprocess.SubprocessError):
-        return payload
-    return payload
-
-
-def _provenance_metadata() -> dict[str, Any]:
-    return {"python": platform.python_version()}
-
-
-def _resolve_cfg(cfg: Any) -> dict[str, Any]:
-    try:
-        resolved = resolve_config(cfg)
-    except ConfigError:
-        if isinstance(cfg, Mapping):
-            return dict(cfg)
-        raise
-    return resolved
 
 
 def _extract_gnn_cfg(cfg: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -152,18 +113,36 @@ def _coerce_run_ids(value: Any) -> list[str]:
     raise ConfigError("run_id(s) must be a string or sequence of strings.")
 
 
-def _extract_run_ids(cfg: Mapping[str, Any]) -> list[str]:
+def _extract_run_ids(
+    cfg: Mapping[str, Any],
+    *,
+    store: Optional[ArtifactStore] = None,
+) -> list[str]:
     inputs = cfg.get("inputs")
+    run_set_id: Any = None
     run_ids: Any = None
     if inputs is None:
         run_ids = None
     elif not isinstance(inputs, Mapping):
         raise ConfigError("gnn_dataset.inputs must be a mapping.")
     else:
+        if "run_set_id" in inputs:
+            run_set_id = inputs.get("run_set_id")
         for key in ("runs", "run_ids", "run_id", "run"):
             if key in inputs:
                 run_ids = inputs.get(key)
                 break
+        if run_set_id is not None and run_ids is not None:
+            raise ConfigError("Specify only one of run_set_id or run_id(s).")
+    if run_set_id is None and "run_set_id" in cfg:
+        run_set_id = cfg.get("run_set_id")
+        if run_set_id is not None and run_ids is not None:
+            raise ConfigError("Specify only one of run_set_id or run_id(s).")
+    if run_set_id is not None:
+        run_set_id = _require_nonempty_str(run_set_id, "run_set_id")
+        if store is None:
+            raise ConfigError("run_set_id requires a store to be provided.")
+        return load_run_ids_from_run_set(store, run_set_id)
     if run_ids is None:
         for key in ("runs", "run_ids", "run_id", "run"):
             if key in cfg:
@@ -274,32 +253,6 @@ def _default_feature_specs(data_vars: Mapping[str, Any]) -> list[NodeFeatureSpec
     return specs
 
 
-def _load_run_dataset_payload(run_dir: Path) -> dict[str, Any]:
-    dataset_path = run_dir / "state.zarr" / "dataset.json"
-    if dataset_path.exists():
-        try:
-            payload = json.loads(dataset_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise ArtifactError(f"Run dataset JSON is invalid: {exc}") from exc
-        if not isinstance(payload, Mapping):
-            raise ArtifactError("Run dataset JSON must be a mapping.")
-        return dict(payload)
-    if xr is None:
-        raise ArtifactError(
-            "Run dataset not found; install xarray to load state.zarr."
-        )
-    dataset = xr.open_zarr(run_dir / "state.zarr")
-    coords = {
-        name: {"dims": [name], "data": dataset.coords[name].values.tolist()}
-        for name in dataset.coords
-    }
-    data_vars = {
-        name: {"dims": list(dataset[name].dims), "data": dataset[name].values.tolist()}
-        for name in dataset.data_vars
-    }
-    return {"coords": coords, "data_vars": data_vars, "attrs": dict(dataset.attrs)}
-
-
 def _extract_time_values(payload: Mapping[str, Any]) -> list[float]:
     coords = payload.get("coords", {})
     if not isinstance(coords, Mapping):
@@ -338,7 +291,7 @@ def _load_graph_payload(path: Path) -> dict[str, Any]:
     if not graph_path.exists():
         raise ConfigError(f"graph.json not found in {path}.")
     try:
-        payload = json.loads(graph_path.read_text(encoding="utf-8"))
+        payload = read_json(graph_path)
     except json.JSONDecodeError as exc:
         raise ConfigError(f"graph.json is not valid JSON: {exc}") from exc
     if not isinstance(payload, Mapping):
@@ -639,10 +592,7 @@ def _write_node_features_table(rows: Sequence[Mapping[str, Any]], path: Path) ->
         pq.write_table(table, path)
         return
     payload = {"columns": list(TABLE_COLUMNS), "rows": list(rows)}
-    path.write_text(
-        json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    write_json_atomic(path, payload)
     logger = logging.getLogger("rxn_platform.gnn_dataset")
     logger.warning(
         "Parquet writer unavailable; stored JSON payload at %s.",
@@ -670,7 +620,7 @@ def run(
     resolved_cfg = _resolve_cfg(cfg)
     manifest_cfg, gnn_cfg = _extract_gnn_cfg(resolved_cfg)
     params = _extract_params(gnn_cfg)
-    run_ids = _extract_run_ids(gnn_cfg)
+    run_ids = _extract_run_ids(gnn_cfg, store=store)
     graph_id = _extract_graph_id(gnn_cfg)
 
     node_kinds = _coerce_str_sequence(
@@ -710,7 +660,7 @@ def run(
     for run_id in run_ids:
         store.read_manifest("runs", run_id)
         run_dir = store.artifact_dir("runs", run_id)
-        run_payload = _load_run_dataset_payload(run_dir)
+        run_payload = load_run_dataset_payload(run_dir)
         time_values = _extract_time_values(run_payload)
         gas_species = _extract_coord_values(run_payload, "species")
         surface_species = _extract_coord_values(run_payload, "surface_species")
@@ -825,16 +775,12 @@ def run(
         exclude_keys=("hydra",),
     )
     parents = list(dict.fromkeys(list(run_ids) + [graph_id]))
-    manifest = ArtifactManifest(
-        schema_version=1,
+    manifest = build_manifest(
         kind="gnn_datasets",
-        id=artifact_id,
-        created_at=_utc_now_iso(),
+        artifact_id=artifact_id,
         parents=parents,
         inputs=inputs_payload,
         config=manifest_cfg,
-        code=_code_metadata(),
-        provenance=_provenance_metadata(),
     )
 
     dataset_meta: dict[str, Any] = {
@@ -876,15 +822,559 @@ def run(
             if _write_node_features_npz(npz_path, npz_payload):
                 files_meta["node_features_npz"] = npz_path.name
         dataset_meta["files"] = files_meta
-        (base_dir / "dataset.json").write_text(
-            json.dumps(dataset_meta, ensure_ascii=True, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        write_json_atomic(base_dir / "dataset.json", dataset_meta)
 
     return store.ensure(manifest, writer=_writer)
 
 
+def _resolve_dataset_root(store_root: Path, dataset_name: str) -> Path:
+    if not isinstance(dataset_name, str) or not dataset_name.strip():
+        raise ConfigError("dataset_name must be a non-empty string.")
+    dataset_path = Path(dataset_name)
+    if dataset_path.is_absolute() or ".." in dataset_path.parts:
+        raise ConfigError("dataset_name must be a relative path without '..'.")
+    if len(dataset_path.parts) > 1:
+        raise ConfigError("dataset_name must be a single path component.")
+    run_root = store_root.parent if store_root.name == "artifacts" else store_root
+    return run_root / "datasets" / dataset_path.name
+
+
+def _normalize_split_cfg(
+    params: Mapping[str, Any],
+    resolved_cfg: Mapping[str, Any],
+) -> dict[str, Any]:
+    split_cfg = params.get("split") or params.get("splits") or {}
+    if split_cfg is None:
+        split_cfg = {}
+    if not isinstance(split_cfg, Mapping):
+        raise ConfigError("split must be a mapping.")
+    try:
+        train_ratio = float(split_cfg.get("train_ratio", split_cfg.get("train", 0.8)))
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("split.train_ratio must be numeric.") from exc
+    val_ratio_raw = split_cfg.get("val_ratio", split_cfg.get("val"))
+    if val_ratio_raw is None:
+        val_ratio = max(0.0, 1.0 - train_ratio)
+    else:
+        try:
+            val_ratio = float(val_ratio_raw)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError("split.val_ratio must be numeric.") from exc
+
+    if train_ratio < 0.0 or val_ratio < 0.0:
+        raise ConfigError("split ratios must be non-negative.")
+    if train_ratio + val_ratio > 1.0 + 1e-8:
+        raise ConfigError("split ratios must sum to <= 1.0.")
+
+    seed = split_cfg.get("seed", params.get("seed"))
+    if seed is None and isinstance(resolved_cfg.get("common"), Mapping):
+        seed = resolved_cfg["common"].get("seed")
+    if seed is None:
+        seed = 0
+    try:
+        seed_value = int(seed)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("split.seed must be an integer.") from exc
+    shuffle = split_cfg.get("shuffle", True)
+    return {
+        "train_ratio": train_ratio,
+        "val_ratio": val_ratio,
+        "seed": seed_value,
+        "shuffle": bool(shuffle),
+    }
+
+
+def _split_indices(
+    total: int,
+    split_cfg: Mapping[str, Any],
+) -> dict[str, list[int]]:
+    indices = list(range(total))
+    if split_cfg.get("shuffle", True):
+        rng = random.Random(split_cfg.get("seed", 0))
+        rng.shuffle(indices)
+    train_count = int(total * float(split_cfg.get("train_ratio", 0.8)))
+    val_count = int(total * float(split_cfg.get("val_ratio", 0.2)))
+    if train_count + val_count > total:
+        val_count = max(0, total - train_count)
+    train_idx = indices[:train_count]
+    val_idx = indices[train_count : train_count + val_count]
+    test_idx = indices[train_count + val_count :]
+    return {"train": train_idx, "val": val_idx, "test": test_idx}
+
+
+def _normalize_constraint_groups(
+    value: Any,
+    node_order: Sequence[str],
+) -> dict[str, Any]:
+    if value is None:
+        return {"group_ids": [], "source": None}
+    if isinstance(value, Mapping):
+        group_ids = [value.get(node_id) for node_id in node_order]
+        return {"group_ids": group_ids, "source": "mapping"}
+    if isinstance(value, Sequence) and not isinstance(
+        value,
+        (str, bytes, bytearray),
+    ):
+        group_ids = list(value)
+        if len(group_ids) != len(node_order):
+            raise ConfigError("constraint_groups length must match node count.")
+        return {"group_ids": group_ids, "source": "sequence"}
+    raise ConfigError("constraint_groups must be a mapping or sequence.")
+
+
+def _load_csr_payload(path: Path) -> dict[str, Any]:
+    if np is None:
+        raise ConfigError("numpy is required to load sparse matrices.")
+    if not path.exists():
+        raise ConfigError(f"Missing sparse matrix file: {path}")
+    if sp is not None:
+        try:
+            return {"matrix": sp.load_npz(path)}
+        except Exception as exc:
+            raise ConfigError(f"Invalid sparse matrix file: {path}") from exc
+    try:
+        payload = np.load(path, allow_pickle=False)
+    except Exception as exc:
+        raise ConfigError(f"Invalid sparse matrix file: {path}") from exc
+    required = {"data", "indices", "indptr", "shape"}
+    if not required.issubset(payload.files):
+        raise ConfigError(f"Invalid sparse matrix payload: {path}")
+    return {
+        "data": payload["data"],
+        "indices": payload["indices"],
+        "indptr": payload["indptr"],
+        "shape": payload["shape"],
+    }
+
+
+def _csr_to_edges(payload: Mapping[str, Any]) -> tuple[list[int], list[int], list[float]]:
+    if "matrix" in payload:
+        matrix = payload["matrix"]
+        coo = matrix.tocoo()
+        rows = [int(value) for value in coo.row.tolist()]
+        cols = [int(value) for value in coo.col.tolist()]
+        vals = [float(value) for value in coo.data.tolist()]
+        return rows, cols, vals
+
+    data = payload.get("data")
+    indices = payload.get("indices")
+    indptr = payload.get("indptr")
+    shape = payload.get("shape")
+    if data is None or indices is None or indptr is None or shape is None:
+        raise ConfigError("Sparse payload is missing required arrays.")
+    rows: list[int] = []
+    cols: list[int] = []
+    vals: list[float] = []
+    n_rows = int(shape[0])
+    for row in range(n_rows):
+        start = int(indptr[row])
+        end = int(indptr[row + 1])
+        for idx in range(start, end):
+            rows.append(row)
+            cols.append(int(indices[idx]))
+            vals.append(float(data[idx]))
+    return rows, cols, vals
+
+
+def _aggregate_window_vector(
+    matrix: Sequence[Sequence[Any]],
+    start_idx: int,
+    end_idx: int,
+    method: str,
+) -> list[float]:
+    if start_idx < 0 or end_idx < start_idx:
+        raise ConfigError("Invalid window indices for feature aggregation.")
+    if not matrix:
+        return []
+    if end_idx >= len(matrix):
+        raise ConfigError("Window index exceeds time series length.")
+    window = matrix[start_idx : end_idx + 1]
+    if not window:
+        return [math.nan for _ in range(len(matrix[0]))]
+    if np is not None:
+        arr = np.asarray(window, dtype=float)
+        if method == "mean":
+            return arr.mean(axis=0).tolist()
+        if method == "sum":
+            return arr.sum(axis=0).tolist()
+        raise ConfigError("feature_aggregation must be 'mean' or 'sum'.")
+
+    if method == "mean":
+        total = [0.0 for _ in range(len(window[0]))]
+        for row in window:
+            for idx, value in enumerate(row):
+                total[idx] += float(value)
+        return [value / float(len(window)) for value in total]
+    if method == "sum":
+        total = [0.0 for _ in range(len(window[0]))]
+        for row in window:
+            for idx, value in enumerate(row):
+                total[idx] += float(value)
+        return total
+    raise ConfigError("feature_aggregation must be 'mean' or 'sum'.")
+
+
+def _torch_available() -> bool:
+    try:
+        import torch  # noqa: F401
+        return True
+    except ImportError:  # pragma: no cover - optional dependency
+        return False
+
+
+def _pyg_available() -> bool:
+    try:
+        import torch_geometric  # noqa: F401
+        return True
+    except ImportError:  # pragma: no cover - optional dependency
+        return False
+
+
+def run_temporal_graph_pyg(
+    cfg: Mapping[str, Any],
+    *,
+    store: ArtifactStore,
+    registry: Optional[Registry] = None,
+) -> ArtifactCacheResult:
+    """Build a temporal PyG dataset from a TemporalFluxGraph artifact."""
+    if not isinstance(cfg, Mapping):
+        raise ConfigError("cfg must be a mapping.")
+
+    resolved_cfg = _resolve_cfg(cfg)
+    manifest_cfg, gnn_cfg = _extract_gnn_cfg(resolved_cfg)
+    params = _extract_params(gnn_cfg)
+    run_ids = _extract_run_ids(gnn_cfg, store=store)
+    graph_id = _extract_graph_id(gnn_cfg)
+
+    if np is None:
+        raise ConfigError("numpy is required to build PyG datasets.")
+
+    feature_specs = _normalize_feature_specs(
+        params.get("node_features") or params.get("features")
+    )
+    node_kinds = _coerce_str_sequence(
+        params.get("node_kinds") or params.get("kinds"),
+        "node_kinds",
+    )
+    if not node_kinds:
+        node_kinds = list(DEFAULT_NODE_KINDS)
+    if any(kind != "species" for kind in node_kinds):
+        raise ConfigError("temporal_graph_pyg currently supports species nodes only.")
+
+    missing_strategy = _normalize_missing_strategy(params.get("missing_strategy"))
+    feature_agg = params.get("feature_aggregation", "mean")
+    if not isinstance(feature_agg, str):
+        raise ConfigError("feature_aggregation must be a string.")
+    feature_agg = feature_agg.strip().lower()
+
+    split_cfg = _normalize_split_cfg(params, resolved_cfg)
+    sort_cases = params.get("sort_cases", True)
+
+    dataset_name = params.get("dataset_name", "temporal_graph_pyg")
+    dataset_root = _resolve_dataset_root(store.root, str(dataset_name))
+
+    store.read_manifest("graphs", graph_id)
+    graph_dir = store.artifact_dir("graphs", graph_id)
+    graph_payload = _load_graph_payload(graph_dir)
+
+    nodes_raw = graph_payload.get("nodes")
+    if nodes_raw is None:
+        raise ConfigError("graph.json nodes are missing.")
+    nodes = _normalize_nodes(nodes_raw)
+    graph_nodes = _prepare_graph_nodes(nodes, node_kinds=node_kinds)
+    if not graph_nodes:
+        raise ConfigError("graph.json has no nodes matching requested kinds.")
+    node_order = [node.get("id") for node in graph_nodes]
+
+    species_order: list[str] = []
+    species_payload = graph_payload.get("species")
+    if isinstance(species_payload, Mapping):
+        order = species_payload.get("order")
+        if isinstance(order, Sequence) and not isinstance(
+            order,
+            (str, bytes, bytearray),
+        ):
+            species_order = [str(name) for name in order]
+
+    graph_layers_payload = None
+    species_graph = graph_payload.get("species_graph")
+    if isinstance(species_graph, Mapping):
+        graph_layers_payload = species_graph.get("layers")
+    if not isinstance(graph_layers_payload, Sequence):
+        raise ConfigError("graph.json species_graph.layers are missing.")
+
+    layers_meta = [dict(layer) for layer in graph_layers_payload]
+    if not layers_meta:
+        raise ConfigError("graph.json species_graph has no layers.")
+
+    if sort_cases:
+        run_ids = sorted(run_ids)
+
+    node_meta = None
+    node_axis_indices: list[Optional[int]] = []
+    window_meta: list[dict[str, Any]] = []
+    edge_sets: dict[int, tuple[list[int], list[int], list[float]]] = {}
+
+    for layer in layers_meta:
+        path_value = layer.get("path")
+        if not isinstance(path_value, str) or not path_value.strip():
+            raise ConfigError("graph layer path is missing.")
+        layer_path = graph_dir / path_value
+        payload = _load_csr_payload(layer_path)
+        layer_index = int(layer.get("index", len(window_meta)))
+        edge_sets[layer_index] = _csr_to_edges(payload)
+        window_meta.append(
+            {
+                "index": layer_index,
+                "window": layer.get("window", {}),
+                "path": path_value,
+                "nnz": layer.get("nnz"),
+            }
+        )
+
+    case_items: list[dict[str, Any]] = []
+    feature_names: list[str] = []
+    missing_features: dict[str, list[str]] = {}
+    time_by_run: dict[str, dict[str, Any]] = {}
+
+    for run_id in run_ids:
+        store.read_manifest("runs", run_id)
+        run_dir = store.artifact_dir("runs", run_id)
+        run_payload = load_run_dataset_payload(run_dir)
+        time_values = _extract_time_values(run_payload)
+        gas_species = _extract_coord_values(run_payload, "species")
+        surface_species = _extract_coord_values(run_payload, "surface_species")
+
+        if species_order and gas_species and gas_species != species_order:
+            raise ConfigError("temporal_graph_pyg requires consistent species ordering.")
+        if not species_order and gas_species:
+            species_order = list(gas_species)
+
+        data_vars = run_payload.get("data_vars", {})
+        if not isinstance(data_vars, Mapping):
+            raise ArtifactError("Run dataset data_vars must be a mapping.")
+        if not feature_specs:
+            feature_specs = _default_feature_specs(data_vars)
+        if not feature_names:
+            feature_names = [spec.name for spec in feature_specs]
+
+        if node_meta is None:
+            node_meta = _build_node_meta(graph_nodes, gas_species, surface_species)
+            node_axis_indices = _axis_indices(
+                graph_nodes,
+                "species",
+                gas_species,
+                surface_species,
+            )
+
+        feature_matrices: list[Optional[list[list[Any]]]] = []
+        for spec in feature_specs:
+            matrix, axis, missing = _extract_feature_matrix(
+                data_vars,
+                spec,
+                time_values,
+                gas_species,
+                surface_species,
+                missing_strategy,
+            )
+            if missing:
+                missing_features.setdefault(run_id, []).append(spec.name)
+                feature_matrices.append(None)
+                continue
+            if axis != "species":
+                raise ConfigError("temporal_graph_pyg only supports species features.")
+            feature_matrices.append(matrix)
+
+        for window in window_meta:
+            window_info = window.get("window", {})
+            start_idx = int(window_info.get("start_idx", 0))
+            end_idx = int(window_info.get("end_idx", 0))
+            node_count = len(node_order)
+            feature_count = len(feature_specs)
+            node_features = [
+                [math.nan for _ in range(feature_count)]
+                for _ in range(node_count)
+            ]
+            for feat_index, matrix in enumerate(feature_matrices):
+                if matrix is None:
+                    continue
+                agg_values = _aggregate_window_vector(
+                    matrix,
+                    start_idx,
+                    end_idx,
+                    feature_agg,
+                )
+                for node_index, axis_index in enumerate(node_axis_indices):
+                    if axis_index is None:
+                        continue
+                    try:
+                        node_features[node_index][feat_index] = float(
+                            agg_values[axis_index]
+                        )
+                    except (IndexError, TypeError, ValueError) as exc:
+                        raise ArtifactError(
+                            "Aggregated feature values are invalid."
+                        ) from exc
+
+            case_items.append(
+                {
+                    "run_id": run_id,
+                    "case_id": run_id,
+                    "window_id": int(window.get("index", 0)),
+                    "window": window_info,
+                    "features": node_features,
+                }
+            )
+
+        time_by_run[run_id] = {
+            "count": len(time_values),
+            "values": list(time_values),
+        }
+
+    if node_meta is None:
+        raise ConfigError("No runs provided for temporal_graph_pyg.")
+
+    if not case_items:
+        raise ConfigError("No dataset items produced for temporal_graph_pyg.")
+    split_indices = _split_indices(len(case_items), split_cfg)
+    constraint_meta = _normalize_constraint_groups(
+        params.get("constraint_groups"), node_order
+    )
+
+    inputs_payload = {
+        "run_ids": list(run_ids),
+        "graph_id": graph_id,
+        "node_kinds": list(node_kinds),
+        "features": feature_names,
+        "feature_aggregation": feature_agg,
+        "split": dict(split_cfg),
+        "dataset_name": str(dataset_name),
+    }
+    artifact_id = make_artifact_id(
+        inputs=inputs_payload,
+        config=manifest_cfg,
+        code=_code_metadata(),
+        exclude_keys=("hydra",),
+    )
+    parents = list(dict.fromkeys(list(run_ids) + [graph_id]))
+    manifest = build_manifest(
+        kind="gnn_datasets",
+        artifact_id=artifact_id,
+        parents=parents,
+        inputs=inputs_payload,
+        config=manifest_cfg,
+    )
+
+    dataset_dir = dataset_root / artifact_id
+    dataset_meta: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": "temporal_graph_pyg",
+        "id": artifact_id,
+        "created_at": utc_now_iso(),
+        "source": {"graph_id": graph_id, "run_ids": list(run_ids)},
+        "nodes": {"count": len(node_order), "order": node_order, "meta": node_meta},
+        "species": {"order": species_order or []},
+        "features": {"count": len(feature_names), "names": feature_names},
+        "constraints": constraint_meta,
+        "windows": window_meta,
+        "time": {"coord": "time", "by_run": time_by_run},
+        "splits": split_indices,
+        "split_config": dict(split_cfg),
+        "keys": [
+            {"case_id": item["case_id"], "window_id": item["window_id"]}
+            for item in case_items
+        ],
+        "dataset_root": str(dataset_dir),
+    }
+    if missing_features:
+        dataset_meta["missing_features"] = missing_features
+
+    def _writer(base_dir: Path) -> None:
+        dataset_dir.mkdir(parents=True, exist_ok=True)
+        files_meta: dict[str, Any] = {}
+        if _torch_available() and _pyg_available():
+            import torch
+            from torch_geometric.data import Data
+
+            data_list = []
+            for item in case_items:
+                window_id = item["window_id"]
+                if window_id not in edge_sets:
+                    raise ConfigError(
+                        f"Missing edge data for window_id={window_id}."
+                    )
+                rows, cols, vals = edge_sets[window_id]
+                if rows:
+                    edge_index = torch.tensor([rows, cols], dtype=torch.long)
+                    edge_attr = torch.tensor(vals, dtype=torch.float32).view(-1, 1)
+                    edge_weight = edge_attr.view(-1)
+                else:
+                    edge_index = torch.empty((2, 0), dtype=torch.long)
+                    edge_attr = torch.empty((0, 1), dtype=torch.float32)
+                    edge_weight = torch.empty((0,), dtype=torch.float32)
+                x = torch.tensor(item["features"], dtype=torch.float32)
+                data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
+                data.edge_weight = edge_weight
+                data.case_id = item["case_id"]
+                data.run_id = item["run_id"]
+                data.window_id = window_id
+                window_info = item.get("window", {})
+                data.window_start = float(window_info.get("start_time", 0.0))
+                data.window_end = float(window_info.get("end_time", 0.0))
+                data.window_index = int(window_info.get("start_idx", 0))
+                data_list.append(data)
+
+            data_path = dataset_dir / "data.pt"
+            torch.save(
+                {
+                    "data_list": data_list,
+                    "splits": split_indices,
+                    "keys": dataset_meta["keys"],
+                },
+                data_path,
+            )
+            files_meta["data_pt"] = data_path.name
+            dataset_meta["format"] = "pyg"
+        else:
+            data_path = dataset_dir / "data.json"
+            payload_items: list[dict[str, Any]] = []
+            for item in case_items:
+                window_id = item["window_id"]
+                if window_id not in edge_sets:
+                    raise ConfigError(
+                        f"Missing edge data for window_id={window_id}."
+                    )
+                rows, cols, vals = edge_sets[window_id]
+                payload_items.append(
+                    {
+                        "case_id": item["case_id"],
+                        "run_id": item["run_id"],
+                        "window_id": window_id,
+                        "window": item.get("window", {}),
+                        "x": item["features"],
+                        "edge_index": [rows, cols],
+                        "edge_attr": vals,
+                    }
+                )
+            write_json_atomic(
+                data_path,
+                {"items": payload_items, "splits": split_indices},
+            )
+            files_meta["data_json"] = data_path.name
+            dataset_meta["format"] = "json"
+            dataset_meta["note"] = (
+                "Install rxn-platform[gnn] for torch/torch_geometric output."
+            )
+
+        dataset_meta["files"] = files_meta
+        write_json_atomic(dataset_dir / "dataset.json", dataset_meta)
+        write_json_atomic(base_dir / "dataset.json", dataset_meta)
+
+    return store.ensure(manifest, writer=_writer)
+
+
+register("task", "gnn_dataset.temporal_graph_pyg", run_temporal_graph_pyg)
 register("task", "gnn_dataset.export", run)
 register("task", "gnn_dataset.run", run)
 
-__all__ = ["NodeFeatureSpec", "run"]
+__all__ = ["NodeFeatureSpec", "run", "run_temporal_graph_pyg"]

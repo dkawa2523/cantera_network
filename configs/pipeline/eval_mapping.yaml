@@ -1,0 +1,12 @@
+name: eval_mapping
+steps:
+  - id: mapping_eval
+    task: reduction.evaluate_mapping
+    inputs:
+      gnn: ${eval_mapping.gnn}
+      compare: ${eval_mapping.compare}
+    params:
+      qoi: ${eval_mapping.qoi}
+      viz: ${eval_mapping.viz}
+      report: ${eval_mapping.report}
+      symmetrize: ${eval_mapping.symmetrize}

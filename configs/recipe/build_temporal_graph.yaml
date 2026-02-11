@@ -1,0 +1,14 @@
+# @package _global_
+defaults:
+  - override /sim: dummy
+  - override /pipeline: build_temporal_graph
+  - _self_
+
+recipe:
+  name: build_temporal_graph
+  description: Build a temporal flux graph from a dummy simulation.
+
+sim:
+  outputs:
+    include_rop: true
+    include_wdot: false

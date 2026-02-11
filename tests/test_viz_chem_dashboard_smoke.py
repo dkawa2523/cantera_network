@@ -78,5 +78,5 @@ def test_viz_chem_dashboard_smoke(tmp_path: Path) -> None:
     assert "Species Time Series" in html
     assert "Rate-of-Production Ranking" in html
     assert "No ROP data available." in html
-    assert "Reaction Network Subgraph" in html
-    assert "No graph data available." in html
+    assert "Mechanism Networks (Graphviz)" in html
+    assert "No graphviz networks available." in html

@@ -9,6 +9,8 @@ from typing import Any, Optional
 
 from rxn_platform.core import ArtifactManifest, load_manifest
 from rxn_platform.errors import ValidationError
+from rxn_platform.io_utils import read_json
+from rxn_platform.run_store import resolve_run_dataset_dir
 
 try:  # Optional dependency.
     import pandas as pd
@@ -104,43 +106,47 @@ def _resolve_table_columns(
         return [str(col) for col in table_columns]
     columns = _read_parquet_columns(path)
     if columns is None:
-        missing.append(
-            f"{path.name} columns (install pandas/pyarrow or provide columns)"
-        )
+        if pq is None and pd is None:
+            missing.append(
+                f"{path.name} columns (install pandas/pyarrow or provide columns)"
+            )
+        else:
+            missing.append(f"{path.name} columns (parquet read failed)")
         return None
     return columns
 
 
 def _read_run_dataset_metadata(
-    state_dir: Path,
+    dataset_dir: Path,
     missing: list[str],
 ) -> tuple[Optional[set[str]], Optional[Mapping[str, Any]]]:
-    dataset_json = state_dir / "dataset.json"
+    dataset_label = dataset_dir.name
+    dataset_json = dataset_dir / "dataset.json"
     if dataset_json.exists():
         try:
-            payload = json.loads(dataset_json.read_text(encoding="utf-8"))
+            payload = read_json(dataset_json)
         except json.JSONDecodeError as exc:
             raise ValidationError(
-                f"state.zarr/dataset.json is not valid JSON: {exc}"
+                f"{dataset_label}/dataset.json is not valid JSON: {exc}"
             ) from exc
         coords = payload.get("coords")
         attrs = payload.get("attrs")
         if not isinstance(coords, Mapping):
-            missing.append("state.zarr/dataset.json.coords")
+            missing.append(f"{dataset_label}/dataset.json.coords")
             return None, None
         if not isinstance(attrs, Mapping):
-            missing.append("state.zarr/dataset.json.attrs")
+            missing.append(f"{dataset_label}/dataset.json.attrs")
             return None, None
         return set(coords.keys()), attrs
     if xr is not None:
         try:
-            dataset = xr.open_zarr(state_dir)
+            dataset = xr.open_zarr(dataset_dir)
         except Exception as exc:
             raise ValidationError(
-                f"state.zarr could not be opened with xarray: {exc}"
+                f"{dataset_label} could not be opened with xarray: {exc}"
             ) from exc
         return set(dataset.coords.keys()), dataset.attrs
-    missing.append("state.zarr dataset metadata")
+    missing.append(f"{dataset_label} dataset metadata")
     return None, None
 
 
@@ -155,11 +161,11 @@ def validate_run_artifact(
     manifest_obj = _load_manifest_for_dir(path, manifest, missing)
     _validate_manifest_kind(manifest_obj, "runs", missing)
 
-    state_dir = path / RUN_STATE_DIRNAME
-    if not state_dir.exists():
-        missing.append(RUN_STATE_DIRNAME)
+    dataset_dir = resolve_run_dataset_dir(path)
+    if dataset_dir is None:
+        missing.append("sim/timeseries.zarr|state.zarr")
     else:
-        coords, attrs = _read_run_dataset_metadata(state_dir, missing)
+        coords, attrs = _read_run_dataset_metadata(dataset_dir, missing)
         if coords is not None:
             if "time" not in coords:
                 missing.append("coords.time")
@@ -217,7 +223,7 @@ def validate_graph_artifact(
         missing.append("graph.json|stoich.npz")
     if graph_path.exists():
         try:
-            json.loads(graph_path.read_text(encoding="utf-8"))
+            read_json(graph_path)
         except json.JSONDecodeError as exc:
             raise ValidationError(
                 f"graph.json is not valid JSON: {exc}"

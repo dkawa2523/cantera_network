@@ -1,0 +1,30 @@
+# Minimal smoke pipeline for dummy backend
+steps:
+  - id: sim
+    task: sim.run
+    sim: ${sim}
+    inputs: {}
+    params: {}
+  - id: obs
+    task: observables.compute
+    inputs: { runs: "@sim" }
+    params:
+      observables: [gas_composition]
+  - id: g
+    task: graphs.from_run
+    inputs: { runs: "@sim" }
+    params: {}
+  - id: f
+    task: features.run
+    inputs: { runs: "@sim", graphs: "@g" }
+    params:
+      features:
+        timeseries_summary:
+          variables: [T, P]
+  - id: viz
+    task: viz.ds_dashboard
+    name: bench_dummy_smoke
+    dashboard: ds
+    chart_backend: matplotlib
+    inputs: { runs: "@sim", observables: "@obs", graphs: "@g", features: "@f" }
+    params: {}

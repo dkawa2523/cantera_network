@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "items": [
+    {
+      "equation": "H + O2 <=> O + OH",
+      "multiplier": 1.15
+    },
+    {
+      "equation": "OH + CO <=> H + CO2",
+      "multiplier": 0.85
+    },
+    {
+      "equation": "CH4 + OH <=> CH3 + H2O",
+      "multiplier": 1.1
+    },
+    {
+      "equation": "HO2 + HO2 <=> O2 + H2O2",
+      "multiplier": 0.9
+    },
+    {
+      "equation": "H2O2 (+M) <=> 2 OH (+M)",
+      "multiplier": 1.2
+    },
+    {
+      "equation": "CH3 + O2 <=> O + CH3O",
+      "multiplier": 0.92
+    },
+    {
+      "equation": "CH3 + O2 <=> CH3O + O",
+      "multiplier": 0.92
+    }
+  ]
+}

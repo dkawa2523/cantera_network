@@ -3,11 +3,17 @@ artifacts/*
 !artifacts/.gitkeep
 work/logs/
 work/state.json
+sbi-logs/
 
 # Python cache
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # Local env/files
 .venv/
+.venv_py310/
+.codex/
 .DS_Store

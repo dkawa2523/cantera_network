@@ -9,11 +9,11 @@ from pathlib import Path
 from typing import Any, Optional
 
 from rxn_platform.errors import ConfigError, RxnPlatformError, TaskError
-from rxn_platform.hydra_utils import resolve_config
 import rxn_platform.registry as registry_module
 from rxn_platform.registry import Registry
 from rxn_platform.store import ArtifactCacheResult, ArtifactStore
 from rxn_platform.tasks.base import TaskContext
+from rxn_platform.tasks.common import resolve_cfg as _resolve_cfg
 
 DEFAULT_STORE_ROOT = "artifacts"
 
@@ -32,18 +32,9 @@ def _load_builtin_plugins() -> None:
     import rxn_platform.tasks.doe  # noqa: F401
     import rxn_platform.tasks.dimred  # noqa: F401
     import rxn_platform.tasks.sbi  # noqa: F401
+    import rxn_platform.tasks.gnn_dataset  # noqa: F401
     import rxn_platform.backends.dummy  # noqa: F401
     import rxn_platform.backends.cantera  # noqa: F401
-
-
-def _resolve_cfg(cfg: Any) -> dict[str, Any]:
-    try:
-        resolved = resolve_config(cfg)
-    except (ConfigError, TypeError, ValueError):
-        if isinstance(cfg, Mapping):
-            return dict(cfg)
-        raise
-    return resolved
 
 
 def _select_registry(registry: Optional[Registry]) -> Registry | None:

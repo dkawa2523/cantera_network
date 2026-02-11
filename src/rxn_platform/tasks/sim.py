@@ -3,48 +3,39 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import csv
 from datetime import datetime, timezone
+import hashlib
 import html
-import json
 import math
-import platform
 from pathlib import Path
-import subprocess
 from typing import Any, Optional
-
-from rxn_platform import __version__
 from rxn_platform.backends.base import dump_run_dataset
 from rxn_platform.core import (
-    ArtifactManifest,
     make_artifact_id,
     make_run_id,
     normalize_reaction_multipliers,
     resolve_repo_path,
 )
 from rxn_platform.errors import ArtifactError, BackendError, ConfigError
-from rxn_platform.hydra_utils import resolve_config
+from rxn_platform.io_utils import write_json_atomic
 from rxn_platform.registry import Registry, register, resolve_backend
 from rxn_platform.reporting import render_report_html
+from rxn_platform.run_store import (
+    resolve_run_root_from_store,
+    sync_timeseries_from_artifact,
+)
 from rxn_platform.store import ArtifactCacheResult, ArtifactStore
+from rxn_platform.tasks.common import (
+    build_manifest,
+    code_metadata as _code_metadata,
+    load_run_dataset_payload,
+    resolve_cfg as _resolve_cfg,
+)
 
 RUN_STATE_DIRNAME = "state.zarr"
 DEFAULT_TOP_SPECIES = 3
 DEFAULT_MAX_POINTS = 200
-
-
-def _utc_now_iso() -> str:
-    timestamp = datetime.now(timezone.utc).replace(microsecond=0)
-    return timestamp.isoformat().replace("+00:00", "Z")
-
-
-def _resolve_cfg(cfg: Any) -> dict[str, Any]:
-    try:
-        resolved = resolve_config(cfg)
-    except ConfigError:
-        if isinstance(cfg, Mapping):
-            return dict(cfg)
-        raise
-    return resolved
 
 
 def _ensure_backends_registered() -> None:
@@ -64,38 +55,163 @@ def _extract_sim_cfg(cfg: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, 
     raise ConfigError("sim config is missing.")
 
 
+def _load_csv_rows(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        raise ConfigError(f"conditions_file not found: {path}")
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        rows = [dict(row) for row in reader]
+    if not rows:
+        raise ConfigError(f"conditions_file is empty: {path}")
+    return rows
+
+
+def _select_csv_row(
+    rows: list[dict[str, str]],
+    *,
+    case_id: Optional[str],
+    row_index: Optional[int],
+    case_col: str,
+) -> dict[str, str]:
+    if case_id:
+        for row in rows:
+            if row.get(case_col) == case_id:
+                return row
+        raise ConfigError(f"case_id {case_id!r} not found in conditions file.")
+    if row_index is None:
+        row_index = 0
+    if row_index < 0 or row_index >= len(rows):
+        raise ConfigError("row_index out of range for conditions file.")
+    return rows[row_index]
+
+
+def _coerce_optional_float(value: Any, label: str) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        if not value.strip():
+            return None
+    if isinstance(value, bool):
+        raise ConfigError(f"{label} must be numeric.")
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{label} must be numeric.") from exc
+
+
+def _apply_csv_condition(
+    sim_cfg: Mapping[str, Any],
+    *,
+    temperature: Optional[float],
+    pressure_atm: Optional[float],
+    phi: Optional[float],
+    t_end: Optional[float],
+    case_id: Optional[str],
+) -> dict[str, Any]:
+    updated = dict(sim_cfg)
+    initial = dict(updated.get("initial", {}))
+    if temperature is not None:
+        initial["T"] = temperature
+    if pressure_atm is not None:
+        initial["P"] = pressure_atm * 101325.0
+    if phi is not None:
+        composition = dict(initial.get("X") or {})
+        if phi <= 0.0:
+            raise ConfigError("phi must be positive.")
+        composition["CH4"] = 1.0
+        composition["O2"] = 2.0 / float(phi)
+        composition["N2"] = composition["O2"] * 3.76
+        initial["X"] = composition
+    if initial:
+        updated["initial"] = initial
+
+    if t_end is not None:
+        if "time_grid" in updated and isinstance(updated.get("time_grid"), Mapping):
+            time_grid = dict(updated.get("time_grid") or {})
+            time_grid["stop"] = t_end
+            updated["time_grid"] = time_grid
+        elif "time" in updated and isinstance(updated.get("time"), Mapping):
+            time_cfg = dict(updated.get("time") or {})
+            time_cfg["stop"] = t_end
+            updated["time"] = time_cfg
+        else:
+            updated["time_grid"] = {"start": 0.0, "stop": t_end, "steps": 4}
+    if case_id:
+        updated["condition_id"] = case_id
+    return updated
+
+
+def _extract_run_csv_settings(
+    resolved_cfg: Mapping[str, Any],
+    sim_cfg: Mapping[str, Any],
+) -> tuple[Path, Optional[str], Optional[int], str]:
+    sources: list[Mapping[str, Any]] = []
+    for key in ("params", "inputs", "benchmarks"):
+        value = resolved_cfg.get(key)
+        if isinstance(value, Mapping):
+            sources.append(value)
+    sources.append(resolved_cfg)
+    sources.append(sim_cfg)
+
+    conditions_file: Optional[Any] = None
+    for source in sources:
+        for key in ("conditions_file", "conditions_path", "conditions_csv", "csv"):
+            if key in source:
+                conditions_file = source.get(key)
+                break
+        if conditions_file is not None:
+            break
+    if conditions_file is None:
+        raise ConfigError("conditions_file is required for sim.run_csv.")
+    if not isinstance(conditions_file, (str, Path)) or not str(conditions_file).strip():
+        raise ConfigError("conditions_file must be a non-empty string or Path.")
+    conditions_path = resolve_repo_path(conditions_file)
+
+    case_id: Optional[str] = None
+    row_index: Optional[int] = None
+    case_col: Optional[str] = None
+    for source in sources:
+        if case_id is None:
+            for key in ("case_id", "condition_id", "case"):
+                if key in source and source.get(key) is not None:
+                    case_id = source.get(key)
+                    break
+        if row_index is None and "row_index" in source:
+            row_index = source.get("row_index")
+        if case_col is None:
+            for key in ("case_column", "case_col", "case_field"):
+                if key in source and source.get(key) is not None:
+                    case_col = source.get(key)
+                    break
+        if case_id is not None and row_index is not None and case_col is not None:
+            break
+    if case_id is not None:
+        if not isinstance(case_id, str) or not case_id.strip():
+            raise ConfigError("case_id must be a non-empty string.")
+        case_id = case_id.strip()
+
+    if row_index is not None:
+        if isinstance(row_index, bool):
+            raise ConfigError("row_index must be an integer.")
+        try:
+            row_index = int(row_index)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError("row_index must be an integer.") from exc
+
+    if case_col is None:
+        case_col = "case_id"
+    if not isinstance(case_col, str) or not case_col.strip():
+        raise ConfigError("case_column must be a non-empty string.")
+    case_col = case_col.strip()
+
+    return conditions_path, case_id, row_index, case_col
+
+
 def _backend_name(sim_cfg: Mapping[str, Any]) -> str:
     name = sim_cfg.get("name") or sim_cfg.get("backend")
     if not isinstance(name, str) or not name.strip():
         raise ConfigError("sim.name must be a non-empty string.")
     return name
-
-
-def _code_metadata() -> dict[str, Any]:
-    payload: dict[str, Any] = {"version": __version__}
-    git_dir = Path.cwd() / ".git"
-    if not git_dir.exists():
-        return payload
-    try:
-        commit = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
-        payload["git_commit"] = commit
-        dirty = subprocess.check_output(
-            ["git", "status", "--porcelain"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
-        payload["dirty"] = bool(dirty)
-    except (OSError, subprocess.SubprocessError):
-        return payload
-    return payload
-
-
-def _provenance_metadata() -> dict[str, Any]:
-    return {"python": platform.python_version()}
 
 
 def _as_float(value: Any, label: str, errors: list[str]) -> None:
@@ -275,34 +391,6 @@ def _extract_run_id(viz_cfg: Mapping[str, Any]) -> str:
     return run_id
 
 
-def _load_run_dataset_payload(run_dir: Path) -> dict[str, Any]:
-    dataset_path = run_dir / RUN_STATE_DIRNAME / "dataset.json"
-    if dataset_path.exists():
-        try:
-            payload = json.loads(dataset_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise ArtifactError(f"Run dataset JSON is invalid: {exc}") from exc
-        if not isinstance(payload, Mapping):
-            raise ArtifactError("Run dataset JSON must be a mapping.")
-        return dict(payload)
-    try:
-        import xarray as xr  # type: ignore
-    except Exception as exc:
-        raise ArtifactError(
-            f"Run dataset not found at {dataset_path} (xarray missing: {exc})."
-        ) from exc
-    dataset = xr.open_zarr(run_dir / RUN_STATE_DIRNAME)
-    coords = {
-        name: {"dims": [name], "data": dataset.coords[name].values.tolist()}
-        for name in dataset.coords
-    }
-    data_vars = {
-        name: {"dims": list(dataset[name].dims), "data": dataset[name].values.tolist()}
-        for name in dataset.data_vars
-    }
-    return {"coords": coords, "data_vars": data_vars, "attrs": dict(dataset.attrs)}
-
-
 def _coerce_numeric(values: Sequence[Any]) -> Optional[list[float]]:
     numbers: list[float] = []
     for entry in values:
@@ -440,11 +528,534 @@ def _build_svg_line_chart(
     )
 
 
+def _build_svg_bar_chart(
+    *,
+    title: str,
+    labels: Sequence[str],
+    values: Sequence[float],
+    unit: Optional[str] = None,
+) -> str:
+    if not labels or not values or len(labels) != len(values):
+        return "<p class=\"muted\">No data available.</p>"
+    width = 520
+    height = 200
+    margin_left = 40
+    margin_right = 14
+    margin_top = 20
+    margin_bottom = 36
+
+    max_val = max(values) if values else 0.0
+    if max_val <= 0:
+        max_val = 1.0
+    bar_area_width = width - margin_left - margin_right
+    bar_area_height = height - margin_top - margin_bottom
+    bar_width = bar_area_width / max(len(values), 1)
+
+    bars = []
+    label_items = []
+    for idx, (label, value) in enumerate(zip(labels, values)):
+        x = margin_left + idx * bar_width + bar_width * 0.1
+        w = bar_width * 0.8
+        h = (value / max_val) * bar_area_height
+        y = margin_top + (bar_area_height - h)
+        bars.append(
+            f"<rect x=\"{x:.1f}\" y=\"{y:.1f}\" width=\"{w:.1f}\" height=\"{h:.1f}\" "
+            "rx=\"3\" fill=\"#0f6f68\" opacity=\"0.85\" />"
+        )
+        label_items.append(
+            f"<text x=\"{x + w / 2:.1f}\" y=\"{height - 16}\" "
+            "text-anchor=\"middle\" font-size=\"10\" fill=\"#5f6c77\">"
+            f"{html.escape(str(label))}</text>"
+        )
+
+    unit_text = f" ({html.escape(unit)})" if unit else ""
+    return (
+        "<div>"
+        f"<div style=\"font-size:12px;letter-spacing:0.1em;text-transform:uppercase;color:var(--muted);\">"
+        f"{html.escape(title)}{unit_text}</div>"
+        f"<svg width=\"{width}\" height=\"{height}\" viewBox=\"0 0 {width} {height}\">"
+        f"<line x1=\"{margin_left}\" y1=\"{margin_top}\" "
+        f"x2=\"{margin_left}\" y2=\"{height - margin_bottom}\" "
+        "stroke=\"#c8d0d4\" stroke-width=\"1\" />"
+        f"<line x1=\"{margin_left}\" y1=\"{height - margin_bottom}\" "
+        f"x2=\"{width - margin_right}\" y2=\"{height - margin_bottom}\" "
+        "stroke=\"#c8d0d4\" stroke-width=\"1\" />"
+        + "".join(bars)
+        + "".join(label_items)
+        + "</svg>"
+        "</div>"
+    )
+
+
+def _extract_svg_fragment(chart_html: str) -> Optional[str]:
+    start = chart_html.find("<svg")
+    end = chart_html.rfind("</svg>")
+    if start == -1 or end == -1:
+        return None
+    return chart_html[start : end + len("</svg>")]
+
+
+def _normalize_image_formats(value: Any) -> list[str]:
+    if value is None:
+        return ["png"]
+    if isinstance(value, str):
+        raw = [value]
+    elif isinstance(value, Sequence) and not isinstance(
+        value, (str, bytes, bytearray)
+    ):
+        raw = list(value)
+    else:
+        raise ConfigError("viz.image_formats must be a string or list of strings.")
+    formats: list[str] = []
+    allowed = {"png", "jpg", "jpeg", "svg"}
+    for entry in raw:
+        if not isinstance(entry, str) or not entry.strip():
+            raise ConfigError("viz.image_formats entries must be non-empty strings.")
+        fmt = entry.strip().lower()
+        if fmt not in allowed:
+            raise ConfigError(f"viz.image_formats must be one of: {', '.join(sorted(allowed))}.")
+        if fmt == "jpeg":
+            fmt = "jpg"
+        if fmt not in formats:
+            formats.append(fmt)
+    return formats
+
+
 def _inject_section(html_doc: str, section_html: str) -> str:
     marker = "\n  <script type=\"application/json\" id=\"report-config\">"
     if marker in html_doc:
         return html_doc.replace(marker, section_html + marker, 1)
     return html_doc + section_html
+
+
+def run_csv(
+    cfg: Mapping[str, Any],
+    *,
+    store: ArtifactStore,
+    registry: Optional[Registry] = None,
+    cache_bust: Optional[str] = None,
+) -> ArtifactCacheResult:
+    """Run a simulation using a single row from a conditions CSV."""
+    if not isinstance(cfg, Mapping):
+        raise ConfigError("cfg must be a mapping.")
+
+    _ensure_backends_registered()
+    resolved_cfg = _resolve_cfg(cfg)
+    manifest_cfg, sim_cfg = _extract_sim_cfg(resolved_cfg)
+
+    conditions_path, case_id, row_index, case_col = _extract_run_csv_settings(
+        resolved_cfg, sim_cfg
+    )
+    rows = _load_csv_rows(conditions_path)
+    row = _select_csv_row(rows, case_id=case_id, row_index=row_index, case_col=case_col)
+
+    def _pick_value(keys: Sequence[str]) -> Optional[str]:
+        for key in keys:
+            if key in row and row.get(key) is not None:
+                value = row.get(key)
+                if isinstance(value, str) and not value.strip():
+                    return None
+                return value
+        return None
+
+    temperature = _coerce_optional_float(
+        _pick_value(("T0", "T", "temperature")), "temperature"
+    )
+    pressure_atm = _coerce_optional_float(
+        _pick_value(("P0_atm", "P_atm", "P0", "pressure_atm", "pressure")), "pressure_atm"
+    )
+    phi = _coerce_optional_float(_pick_value(("phi",)), "phi")
+    t_end = _coerce_optional_float(
+        _pick_value(("t_end", "t_end_s", "t_end_seconds")), "t_end"
+    )
+    row_case_id = row.get(case_col) if case_col in row else None
+    if isinstance(row_case_id, str) and not row_case_id.strip():
+        row_case_id = None
+    if case_id is None and row_case_id is not None:
+        case_id = row_case_id
+
+    updated_sim_cfg = _apply_csv_condition(
+        sim_cfg,
+        temperature=temperature,
+        pressure_atm=pressure_atm,
+        phi=phi,
+        t_end=t_end,
+        case_id=case_id,
+    )
+
+    updated_cfg = dict(resolved_cfg)
+    updated_cfg["sim"] = updated_sim_cfg
+    return run(updated_cfg, store=store, registry=registry, cache_bust=cache_bust)
+
+
+def _hash_file_16(path: Path) -> str:
+    try:
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise ConfigError(f"Failed to read conditions_file for hashing: {path}") from exc
+    return digest[:16]
+
+
+def _coerce_case_id(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        value = str(value)
+    cleaned = value.strip()
+    return cleaned or None
+
+
+def _require_nonempty_str(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"{label} must be a non-empty string.")
+    return value.strip()
+
+
+def _extract_sweep_csv_settings(
+    resolved_cfg: Mapping[str, Any],
+    sim_cfg: Mapping[str, Any],
+) -> tuple[Path, str, str, list[str], str]:
+    """Return (conditions_path, case_col, case_mode, case_ids, time_grid_policy)."""
+    sources: list[Mapping[str, Any]] = []
+    for key in ("params", "inputs", "benchmarks"):
+        value = resolved_cfg.get(key)
+        if isinstance(value, Mapping):
+            sources.append(value)
+    sources.append(resolved_cfg)
+    sources.append(sim_cfg)
+
+    conditions_file: Optional[Any] = None
+    for source in sources:
+        for key in ("conditions_file", "conditions_path", "conditions_csv", "csv"):
+            if key in source and source.get(key) is not None:
+                conditions_file = source.get(key)
+                break
+        if conditions_file is not None:
+            break
+    if conditions_file is None:
+        raise ConfigError("conditions_file is required for sim.sweep_csv.")
+    if not isinstance(conditions_file, (str, Path)) or not str(conditions_file).strip():
+        raise ConfigError("conditions_file must be a non-empty string or Path.")
+    conditions_path = resolve_repo_path(conditions_file)
+
+    case_col: Optional[Any] = None
+    for source in sources:
+        for key in ("case_column", "case_col", "case_field"):
+            if key in source and source.get(key) is not None:
+                case_col = source.get(key)
+                break
+        if case_col is not None:
+            break
+    if case_col is None:
+        case_col = "case_id"
+    if not isinstance(case_col, str) or not case_col.strip():
+        raise ConfigError("case_col must be a non-empty string.")
+    case_col = case_col.strip()
+
+    case_mode: Optional[Any] = None
+    case_ids_raw: Any = None
+    time_grid_policy: Optional[Any] = None
+    for source in sources:
+        if case_mode is None and "case_mode" in source and source.get("case_mode") is not None:
+            case_mode = source.get("case_mode")
+        if case_ids_raw is None:
+            for key in ("case_ids", "cases", "case_id_list"):
+                if key in source and source.get(key) is not None:
+                    case_ids_raw = source.get(key)
+                    break
+        if time_grid_policy is None and source.get("time_grid_policy") is not None:
+            time_grid_policy = source.get("time_grid_policy")
+
+    if case_mode is None:
+        case_mode = "all"
+    if not isinstance(case_mode, str) or not case_mode.strip():
+        raise ConfigError("case_mode must be a string.")
+    case_mode = case_mode.strip().lower()
+    if case_mode not in {"all", "list"}:
+        raise ConfigError("case_mode must be 'all' or 'list'.")
+
+    selected_case_ids: list[str] = []
+    if case_mode == "list":
+        if case_ids_raw is None:
+            raise ConfigError("case_ids is required when case_mode='list'.")
+        if isinstance(case_ids_raw, str):
+            selected_case_ids = [_require_nonempty_str(case_ids_raw, "case_ids")]
+        elif isinstance(case_ids_raw, Sequence) and not isinstance(
+            case_ids_raw, (str, bytes, bytearray)
+        ):
+            selected_case_ids = [
+                _require_nonempty_str(entry, "case_ids")
+                for entry in case_ids_raw
+                if entry is not None
+            ]
+        else:
+            raise ConfigError("case_ids must be a string or list of strings.")
+        selected_case_ids = sorted({cid.strip() for cid in selected_case_ids if cid.strip()})
+        if not selected_case_ids:
+            raise ConfigError("case_ids must not be empty.")
+
+    if time_grid_policy is None:
+        time_grid_policy = "row"
+    if not isinstance(time_grid_policy, str) or not time_grid_policy.strip():
+        raise ConfigError("time_grid_policy must be a string.")
+    time_grid_policy = time_grid_policy.strip().lower()
+    if time_grid_policy not in {"row", "fixed", "max"}:
+        raise ConfigError("time_grid_policy must be one of: row, fixed, max.")
+
+    return conditions_path, case_col, case_mode, selected_case_ids, time_grid_policy
+
+
+def sweep_csv(
+    cfg: Mapping[str, Any],
+    *,
+    store: ArtifactStore,
+    registry: Optional[Registry] = None,
+) -> ArtifactCacheResult:
+    """Run a simulation for multiple rows from a conditions CSV and return a RunSet artifact."""
+    if not isinstance(cfg, Mapping):
+        raise ConfigError("cfg must be a mapping.")
+
+    _ensure_backends_registered()
+    resolved_cfg = _resolve_cfg(cfg)
+    manifest_cfg, sim_cfg = _extract_sim_cfg(resolved_cfg)
+
+    conditions_path, case_col, case_mode, selected_case_ids, time_grid_policy = (
+        _extract_sweep_csv_settings(resolved_cfg, sim_cfg)
+    )
+    rows = _load_csv_rows(conditions_path)
+
+    # Normalize case ids from rows (fill blanks as row_0000).
+    normalized_rows: list[dict[str, Any]] = []
+    for idx, row in enumerate(rows):
+        row_map = dict(row)
+        row_case_id = _coerce_case_id(row_map.get(case_col))
+        if row_case_id is None:
+            row_case_id = f"row_{idx:04d}"
+            row_map[case_col] = row_case_id
+        normalized_rows.append(row_map)
+
+    row_by_case: dict[str, dict[str, Any]] = {}
+    for idx, row in enumerate(normalized_rows):
+        cid = _coerce_case_id(row.get(case_col)) or f"row_{idx:04d}"
+        if cid in row_by_case:
+            raise ConfigError(f"Duplicate case_id {cid!r} in conditions file.")
+        row_by_case[cid] = row
+
+    if case_mode == "all":
+        case_ids = sorted(row_by_case.keys())
+    else:
+        missing = [cid for cid in selected_case_ids if cid not in row_by_case]
+        if missing:
+            raise ConfigError(f"case_ids not found in conditions file: {', '.join(missing)}")
+        case_ids = list(selected_case_ids)
+
+    def _pick_value(row: Mapping[str, Any], keys: Sequence[str]) -> Optional[str]:
+        for key in keys:
+            if key in row and row.get(key) is not None:
+                value = row.get(key)
+                if isinstance(value, str) and not value.strip():
+                    return None
+                return str(value)
+        return None
+
+    # Determine the applied t_end for time_grid_policy=max.
+    max_t_end: Optional[float] = None
+    if time_grid_policy == "max":
+        for cid in case_ids:
+            row = row_by_case[cid]
+            t_end_row = _coerce_optional_float(
+                _pick_value(row, ("t_end", "t_end_s", "t_end_seconds")),
+                "t_end",
+            )
+            if t_end_row is None:
+                continue
+            if not math.isfinite(t_end_row):
+                continue
+            if max_t_end is None or t_end_row > max_t_end:
+                max_t_end = float(t_end_row)
+
+    # Pass 1: compute per-case sim configs + run_ids without executing the backend.
+    backend_name = _backend_name(sim_cfg)
+    base_time_cfg = sim_cfg.get("time_grid", sim_cfg.get("time"))
+    time_grid_applied: Optional[dict[str, Any]] = None
+    if time_grid_policy in {"fixed", "max"} and isinstance(base_time_cfg, Mapping):
+        start = _coerce_optional_float(base_time_cfg.get("start"), "time.start")
+        stop = _coerce_optional_float(base_time_cfg.get("stop"), "time.stop")
+        steps = base_time_cfg.get("steps")
+        steps_int: Optional[int] = None
+        if steps is not None:
+            if isinstance(steps, bool):
+                raise ConfigError("time.steps must be an integer.")
+            try:
+                steps_int = int(steps)
+            except (TypeError, ValueError) as exc:
+                raise ConfigError("time.steps must be an integer.") from exc
+        # stop may be overridden below for max.
+        if time_grid_policy == "max" and max_t_end is not None:
+            stop = float(max_t_end)
+        time_grid_applied = {
+            "start": float(start) if start is not None else None,
+            "stop": float(stop) if stop is not None else None,
+            "steps": int(steps_int) if steps_int is not None else None,
+        }
+
+    per_case: list[dict[str, Any]] = []
+    for cid in case_ids:
+        row = row_by_case[cid]
+        temperature = _coerce_optional_float(
+            _pick_value(row, ("T0", "T", "temperature")), "temperature"
+        )
+        pressure_atm = _coerce_optional_float(
+            _pick_value(row, ("P0_atm", "P_atm", "P0", "pressure_atm", "pressure")),
+            "pressure_atm",
+        )
+        phi = _coerce_optional_float(_pick_value(row, ("phi",)), "phi")
+        t_end_row = _coerce_optional_float(
+            _pick_value(row, ("t_end", "t_end_s", "t_end_seconds")),
+            "t_end",
+        )
+        if time_grid_policy == "row":
+            t_end_applied = t_end_row
+        elif time_grid_policy == "fixed":
+            t_end_applied = None
+        else:
+            t_end_applied = max_t_end
+
+        updated_sim_cfg = _apply_csv_condition(
+            sim_cfg,
+            temperature=temperature,
+            pressure_atm=pressure_atm,
+            phi=phi,
+            t_end=t_end_applied,
+            case_id=cid,
+        )
+
+        # Match sim.run normalization: normalize multipliers and drop disabled_reactions.
+        try:
+            normalized_multipliers = normalize_reaction_multipliers(updated_sim_cfg)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"reaction multipliers are invalid: {exc}") from exc
+        sim_cfg_norm = dict(updated_sim_cfg)
+        if normalized_multipliers:
+            sim_cfg_norm["reaction_multipliers"] = normalized_multipliers
+        else:
+            sim_cfg_norm.pop("reaction_multipliers", None)
+        sim_cfg_norm.pop("disabled_reactions", None)
+
+        # Match sim.run_csv manifest identity: keep per-case config minimal so that
+        # the resulting run_id does not depend on sweep-level settings.
+        run_manifest_cfg: dict[str, Any] = {
+            "sim": dict(sim_cfg_norm),
+            "inputs": {},
+            "params": {
+                "conditions_file": str(conditions_path),
+                "case_id": cid,
+                "case_column": case_col,
+            },
+        }
+
+        run_id = make_run_id(run_manifest_cfg, exclude_keys=("hydra",))
+        per_case.append(
+            {
+                "case_id": cid,
+                "row": row,
+                "temperature": temperature,
+                "pressure_atm": pressure_atm,
+                "phi": phi,
+                "t_end_row": t_end_row,
+                "t_end_applied": t_end_applied,
+                "sim_cfg": sim_cfg_norm,
+                "run_manifest_cfg": run_manifest_cfg,
+                "run_id": run_id,
+                "normalized_multipliers": normalized_multipliers,
+                "backend_name": backend_name,
+            }
+        )
+
+    run_ids = [entry["run_id"] for entry in per_case]
+    case_to_run = {entry["case_id"]: entry["run_id"] for entry in per_case}
+    conditions_hash = _hash_file_16(conditions_path)
+
+    inputs_payload: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": "run_set",
+        "conditions_file": str(conditions_path),
+        "conditions_hash": conditions_hash,
+        "case_col": case_col,
+        "case_mode": case_mode,
+        "case_ids": list(case_ids),
+        "run_ids": list(run_ids),
+        "case_to_run": dict(case_to_run),
+        "time_grid_policy": time_grid_policy,
+        "time_grid_applied": time_grid_applied,
+    }
+
+    run_set_id = make_artifact_id(
+        inputs=inputs_payload,
+        config=manifest_cfg,
+        code=_code_metadata(),
+        exclude_keys=("hydra",),
+    )
+    run_set_manifest = build_manifest(
+        kind="run_sets",
+        artifact_id=run_set_id,
+        inputs=inputs_payload,
+        config=manifest_cfg,
+    )
+
+    # Fast path: if the run_set already exists, reuse it (no backend calls).
+    if store.exists("run_sets", run_set_id):
+        return store.ensure(run_set_manifest)
+
+    # Pass 2: ensure each run exists (execute backend only for missing runs).
+    backend = resolve_backend(backend_name, registry=registry)
+    run_root = resolve_run_root_from_store(store.root)
+    for entry in per_case:
+        run_id = entry["run_id"]
+        run_manifest_cfg = entry["run_manifest_cfg"]
+        sim_cfg_norm = entry["sim_cfg"]
+        normalized_multipliers = entry["normalized_multipliers"]
+
+        inputs: dict[str, Any] = {}
+        if normalized_multipliers:
+            inputs["reaction_multipliers"] = normalized_multipliers
+        run_manifest = build_manifest(
+            kind="runs",
+            artifact_id=run_id,
+            inputs=inputs,
+            config=run_manifest_cfg,
+        )
+
+        if store.exists("runs", run_id):
+            store.ensure(run_manifest)
+            continue
+
+        dataset = backend.run(sim_cfg_norm)
+
+        def _writer(base_dir: Path, _dataset=dataset) -> None:
+            dump_run_dataset(_dataset, base_dir / RUN_STATE_DIRNAME)
+
+        result = store.ensure(run_manifest, writer=_writer)
+        if run_root is not None:
+            sync_timeseries_from_artifact(result.path, run_root)
+
+    def _writer(base_dir: Path) -> None:
+        runs_json = dict(inputs_payload)
+        runs_json["case_meta"] = [
+            {
+                "case_id": entry["case_id"],
+                "row_index": int(index),
+                "T0": entry["temperature"],
+                "P0_atm": entry["pressure_atm"],
+                "phi": entry["phi"],
+                "t_end_row": entry["t_end_row"],
+                "t_end_applied": entry["t_end_applied"],
+            }
+            for index, entry in enumerate(per_case)
+        ]
+        write_json_atomic(base_dir / "runs.json", runs_json)
+
+    return store.ensure(run_set_manifest, writer=_writer)
 
 
 def run(
@@ -495,25 +1106,26 @@ def run(
             applied_multipliers = applied
     if applied_multipliers:
         inputs["reaction_multipliers"] = applied_multipliers
-    manifest = ArtifactManifest(
-        schema_version=1,
+    manifest = build_manifest(
         kind="runs",
-        id=run_id,
-        created_at=_utc_now_iso(),
-        parents=[],
+        artifact_id=run_id,
         inputs=inputs,
         config=manifest_cfg,
-        code=_code_metadata(),
-        provenance=_provenance_metadata(),
     )
 
     def _writer(base_dir: Path) -> None:
         dump_run_dataset(dataset, base_dir / RUN_STATE_DIRNAME)
 
-    return store.ensure(manifest, writer=_writer)
+    result = store.ensure(manifest, writer=_writer)
+    run_root = resolve_run_root_from_store(store.root)
+    if run_root is not None:
+        sync_timeseries_from_artifact(result.path, run_root)
+    return result
 
 
 register("task", "sim.run", run)
+register("task", "sim.run_csv", run_csv)
+register("task", "sim.sweep_csv", sweep_csv)
 
 def viz(
     cfg: Mapping[str, Any],
@@ -530,7 +1142,12 @@ def viz(
     run_id = _extract_run_id(viz_cfg)
     run_manifest = store.read_manifest("runs", run_id)
     run_dir = store.artifact_dir("runs", run_id)
-    dataset_payload = _load_run_dataset_payload(run_dir)
+    dataset_payload = load_run_dataset_payload(
+        run_dir,
+        xarray_missing_message=(
+            "Run dataset not found at {dataset_path} (xarray missing: {error})."
+        ),
+    )
 
     coords = dataset_payload.get("coords", {})
     data_vars = dataset_payload.get("data_vars", {})
@@ -562,7 +1179,7 @@ def viz(
             else {}
         )
 
-    charts: list[str] = []
+    charts: list[tuple[str, str]] = []
     for key, label in (("T", "Temperature"), ("P", "Pressure")):
         series_payload = data_vars.get(key)
         if not isinstance(series_payload, Mapping):
@@ -575,11 +1192,14 @@ def viz(
         if numeric_values is None or len(numeric_values) != len(time_series):
             continue
         charts.append(
-            _build_svg_line_chart(
-                title=label,
-                times=time_series,
-                series={label: numeric_values},
-                unit=str(units.get(key, "")) if units else None,
+            (
+                key.lower(),
+                _build_svg_line_chart(
+                    title=label,
+                    times=time_series,
+                    series={label: numeric_values},
+                    unit=str(units.get(key, "")) if units else None,
+                ),
             )
         )
 
@@ -598,20 +1218,45 @@ def viz(
             if top_series:
                 series_map = {name: values for name, values in top_series}
                 charts.append(
-                    _build_svg_line_chart(
-                        title="Top Species (X)",
-                        times=time_series,
-                        series=series_map,
-                        unit=str(units.get("X", "")) if units else None,
+                    (
+                        "top_species_x",
+                        _build_svg_line_chart(
+                            title="Top Species (X)",
+                            times=time_series,
+                            series=series_map,
+                            unit=str(units.get("X", "")) if units else None,
+                        ),
                     )
                 )
+            if x_series:
+                last_row = x_series[-1]
+                if isinstance(last_row, Sequence):
+                    last_values = _coerce_numeric(last_row)
+                    if last_values:
+                        pairs = list(zip(species, last_values))
+                        pairs.sort(key=lambda item: item[1], reverse=True)
+                        if top_species > 0:
+                            pairs = pairs[:top_species]
+                        labels = [name for name, _ in pairs]
+                        values = [value for _, value in pairs]
+                        charts.append(
+                            (
+                                "final_composition_x",
+                                _build_svg_bar_chart(
+                                    title="Final Composition (X)",
+                                    labels=labels,
+                                    values=values,
+                                    unit=str(units.get("X", "")) if units else None,
+                                ),
+                            )
+                        )
 
     if charts:
         chart_cards = "".join(
             "<div style=\"border:1px solid var(--border);border-radius:16px;padding:12px;background:#fbfaf7;\">"
-            + chart
+            + chart_html
             + "</div>"
-            for chart in charts
+            for _, chart_html in charts
         )
         charts_html = (
             "<section class=\"panel\">"
@@ -629,6 +1274,73 @@ def viz(
             "</section>"
         )
 
+    export_cfg = viz_cfg.get("export_images", True)
+    export_enabled = True
+    export_dir_name = viz_cfg.get("image_dir", "images")
+    export_formats = _normalize_image_formats(viz_cfg.get("image_formats"))
+    if isinstance(export_cfg, Mapping):
+        if export_cfg.get("enabled") is not None:
+            export_enabled = bool(export_cfg.get("enabled"))
+        if export_cfg.get("dir") is not None:
+            export_dir_name = export_cfg.get("dir")
+        if export_cfg.get("formats") is not None or export_cfg.get("image_formats") is not None:
+            export_formats = _normalize_image_formats(
+                export_cfg.get("formats", export_cfg.get("image_formats"))
+            )
+    else:
+        export_enabled = bool(export_cfg)
+    if not isinstance(export_dir_name, str) or not export_dir_name.strip():
+        raise ConfigError("viz.image_dir must be a non-empty string.")
+
+    svg_exports: list[tuple[str, str]] = []
+    export_paths: list[str] = []
+    export_notes: list[str] = []
+    if export_enabled and charts:
+        need_png = any(fmt in ("png", "jpg") for fmt in export_formats)
+        cairosvg_ok = True
+        pillow_ok = True
+        if need_png:
+            try:
+                import cairosvg  # noqa: F401
+            except Exception:
+                cairosvg_ok = False
+                export_notes.append("PNG/JPG export requires cairosvg (not installed).")
+        if "jpg" in export_formats:
+            try:
+                from PIL import Image  # noqa: F401
+            except Exception:
+                pillow_ok = False
+                export_notes.append("JPG export requires Pillow (not installed).")
+        for name, chart_html in charts:
+            svg = _extract_svg_fragment(chart_html)
+            if svg is None:
+                continue
+            svg_exports.append((name, svg))
+            for fmt in export_formats:
+                if fmt == "jpg" and not (cairosvg_ok and pillow_ok):
+                    continue
+                if fmt in ("png", "jpg") and not cairosvg_ok:
+                    continue
+                export_paths.append(f"{export_dir_name}/{name}.{fmt}")
+
+    image_export_section = ""
+    if export_enabled and export_paths:
+        note_items = "".join(
+            f"<li>{html.escape(note)}</li>" for note in export_notes
+        )
+        path_items = "".join(
+            f"<li>{html.escape(path)}</li>" for path in export_paths
+        )
+        image_export_section = (
+            "<section class=\"panel\">"
+            "<h2>Image Exports</h2>"
+            + ("<ul>" + note_items + "</ul>" if note_items else "")
+            + "<ul>"
+            + path_items
+            + "</ul>"
+            + "</section>"
+        )
+
     inputs_payload = {"artifacts": [{"kind": "runs", "id": run_id}]}
     report_id = make_artifact_id(
         inputs=inputs_payload,
@@ -637,16 +1349,12 @@ def viz(
         exclude_keys=("hydra",),
     )
 
-    report_manifest = ArtifactManifest(
-        schema_version=1,
+    report_manifest = build_manifest(
         kind="reports",
-        id=report_id,
-        created_at=_utc_now_iso(),
+        artifact_id=report_id,
         parents=[run_id],
         inputs=inputs_payload,
         config=manifest_cfg,
-        code=_code_metadata(),
-        provenance=_provenance_metadata(),
         notes=f"Generated from run {run_manifest.id}",
     )
 
@@ -663,9 +1371,53 @@ def viz(
         config=manifest_cfg,
         placeholders=("Quicklook",),
     )
-    html_doc = _inject_section(html_doc, charts_html)
+    html_doc = _inject_section(html_doc, charts_html + image_export_section)
 
     def _writer(base_dir: Path) -> None:
+        if export_enabled and svg_exports:
+            export_dir = base_dir / export_dir_name
+            export_dir.mkdir(parents=True, exist_ok=True)
+            exported: list[str] = []
+            png_supported = "png" in export_formats or "jpg" in export_formats
+            cairosvg = None
+            if png_supported:
+                try:
+                    import cairosvg as _cairosvg  # type: ignore
+
+                    cairosvg = _cairosvg
+                except Exception:
+                    cairosvg = None
+            image_module = None
+            if "jpg" in export_formats and cairosvg is not None:
+                try:
+                    from PIL import Image as _Image  # type: ignore
+
+                    image_module = _Image
+                except Exception:
+                    image_module = None
+            for name, svg in svg_exports:
+                if "svg" in export_formats:
+                    svg_path = export_dir / f"{name}.svg"
+                    svg_path.write_text(svg, encoding="utf-8")
+                    exported.append(f"{export_dir_name}/{svg_path.name}")
+                if cairosvg is not None and (
+                    "png" in export_formats or "jpg" in export_formats
+                ):
+                    png_bytes = cairosvg.svg2png(bytestring=svg.encode("utf-8"))
+                    if "png" in export_formats:
+                        png_path = export_dir / f"{name}.png"
+                        png_path.write_bytes(png_bytes)
+                        exported.append(f"{export_dir_name}/{png_path.name}")
+                    if "jpg" in export_formats and image_module is not None:
+                        import io
+
+                        with io.BytesIO(png_bytes) as buffer:
+                            image = image_module.open(buffer).convert("RGB")
+                            jpg_path = export_dir / f"{name}.jpg"
+                            image.save(jpg_path, format="JPEG", quality=95)
+                            exported.append(f"{export_dir_name}/{jpg_path.name}")
+            if exported:
+                write_json_atomic(export_dir / "index.json", {"files": exported})
         (base_dir / "index.html").write_text(html_doc, encoding="utf-8")
 
     return store.ensure(report_manifest, writer=_writer)

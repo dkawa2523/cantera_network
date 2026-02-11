@@ -1,0 +1,14 @@
+# @package _global_
+defaults:
+  - override /sim: dummy
+  - override /pipeline: reduce_gnn_pool_temporal
+  - _self_
+
+recipe:
+  name: reduce_gnn_pool_temporal
+  description: Build temporal flux graph, GNN DiffPool mapping, and superstate features.
+
+sim:
+  outputs:
+    include_rop: true
+    include_wdot: true

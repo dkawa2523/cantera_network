@@ -1,0 +1,11 @@
+# Benchmark case: gri30_small
+# 条件点は benchmarks/assets/conditions/gri30_small.csv を参照
+case_name: gri30_small
+conditions_file: benchmarks/assets/conditions/gri30_small.csv
+validation_conditions_file: ${benchmarks.conditions_file}
+# Default single-case selection for sim.run_csv (override as needed).
+case_id: c000
+# 目的変数/観測に使う代表種（必要なら変更）
+qoi:
+  species_final: [CO2, CO, H2O, CH4, O2]
+  temperature: true

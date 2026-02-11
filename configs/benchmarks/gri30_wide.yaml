@@ -1,0 +1,8 @@
+case_name: gri30_wide
+conditions_file: benchmarks/assets/conditions/gri30_wide.csv
+validation_conditions_file: ${benchmarks.conditions_file}
+# Default single-case selection for sim.run_csv (override as needed).
+case_id: c000
+qoi:
+  species_final: [CO2, CO, H2O, CH4, O2, NO, NO2]
+  temperature: true

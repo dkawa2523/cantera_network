@@ -4,29 +4,31 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+import csv
 import json
 import logging
 import math
-import platform
 from pathlib import Path
 import random
-import subprocess
 from typing import Any, Optional
-
-from rxn_platform import __version__
 from rxn_platform.core import (
-    ArtifactManifest,
     make_artifact_id,
     make_run_id,
     normalize_reaction_multipliers,
+    resolve_repo_path,
 )
 from rxn_platform.errors import ConfigError
-from rxn_platform.hydra_utils import resolve_config
+from rxn_platform.io_utils import read_json, write_json_atomic
 from rxn_platform.pipelines import PipelineRunner
 from rxn_platform.registry import Registry, register
 from rxn_platform.store import ArtifactCacheResult, ArtifactStore
 from rxn_platform.tasks.base import Task
+from rxn_platform.tasks.common import (
+    build_manifest,
+    code_metadata as _code_metadata,
+    read_table_rows as _read_table_rows,
+    resolve_cfg as _resolve_cfg,
+)
 
 try:  # Optional dependency.
     import pandas as pd
@@ -53,48 +55,6 @@ DEFAULT_INFLATION = 1.0
 DEFAULT_RIDGE = 1.0e-6
 DEFAULT_STEP_SIZE = 1.0
 DEFAULT_LAPLACIAN_LAMBDA = 0.0
-
-
-def _utc_now_iso() -> str:
-    timestamp = datetime.now(timezone.utc).replace(microsecond=0)
-    return timestamp.isoformat().replace("+00:00", "Z")
-
-
-def _code_metadata() -> dict[str, Any]:
-    payload: dict[str, Any] = {"version": __version__}
-    git_dir = Path.cwd() / ".git"
-    if not git_dir.exists():
-        return payload
-    try:
-        commit = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
-        payload["git_commit"] = commit
-        dirty = subprocess.check_output(
-            ["git", "status", "--porcelain"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
-        payload["dirty"] = bool(dirty)
-    except (OSError, subprocess.SubprocessError):
-        return payload
-    return payload
-
-
-def _provenance_metadata() -> dict[str, Any]:
-    return {"python": platform.python_version()}
-
-
-def _resolve_cfg(cfg: Any) -> dict[str, Any]:
-    try:
-        resolved = resolve_config(cfg)
-    except ConfigError:
-        if isinstance(cfg, Mapping):
-            return dict(cfg)
-        raise
-    return resolved
 
 
 def _extract_assim_cfg(
@@ -155,6 +115,355 @@ def _extract_sim_cfg(
     if not isinstance(sim_cfg, Mapping):
         raise ConfigError("assimilation sim config must be provided as a mapping.")
     return dict(sim_cfg)
+
+
+def _load_csv_rows(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        raise ConfigError(f"observations file not found: {path}")
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        rows = [dict(row) for row in reader]
+    if not rows:
+        raise ConfigError(f"observations file is empty: {path}")
+    return rows
+
+
+def _apply_csv_condition(
+    sim_cfg: Mapping[str, Any],
+    *,
+    temperature: Optional[float],
+    pressure_atm: Optional[float],
+    phi: Optional[float],
+    t_end: Optional[float],
+    case_id: Optional[str],
+) -> dict[str, Any]:
+    updated = dict(sim_cfg)
+    initial = dict(updated.get("initial", {}))
+    if temperature is not None:
+        initial["T"] = temperature
+    if pressure_atm is not None:
+        initial["P"] = pressure_atm * 101325.0
+    if phi is not None:
+        if phi <= 0.0:
+            raise ConfigError("phi must be positive.")
+        composition = dict(initial.get("X") or {})
+        composition["CH4"] = 1.0
+        composition["O2"] = 2.0 / float(phi)
+        composition["N2"] = composition["O2"] * 3.76
+        initial["X"] = composition
+    if initial:
+        updated["initial"] = initial
+
+    if t_end is not None:
+        if "time_grid" in updated and isinstance(updated.get("time_grid"), Mapping):
+            time_grid = dict(updated.get("time_grid") or {})
+            time_grid["stop"] = t_end
+            updated["time_grid"] = time_grid
+        elif "time" in updated and isinstance(updated.get("time"), Mapping):
+            time_cfg = dict(updated.get("time") or {})
+            time_cfg["stop"] = t_end
+            updated["time"] = time_cfg
+        else:
+            updated["time_grid"] = {"start": 0.0, "stop": t_end, "steps": 4}
+    if case_id:
+        updated["condition_id"] = case_id
+    return updated
+
+
+def _extract_case_id(
+    resolved_cfg: Mapping[str, Any],
+    assim_cfg: Mapping[str, Any],
+    params: Mapping[str, Any],
+    sim_cfg: Optional[Mapping[str, Any]] = None,
+) -> Optional[str]:
+    for source in (params, assim_cfg, resolved_cfg):
+        if not isinstance(source, Mapping):
+            continue
+        for key in ("observed_case_id", "case_id", "condition_id"):
+            if key in source and source.get(key) is not None:
+                value = source.get(key)
+                if not isinstance(value, str) or not value.strip():
+                    raise ConfigError("case_id must be a non-empty string.")
+                return value.strip()
+    if sim_cfg and isinstance(sim_cfg.get("condition_id"), str):
+        value = sim_cfg.get("condition_id")
+        if value and value.strip():
+            return value.strip()
+    return None
+
+
+def _extract_obs_file(
+    resolved_cfg: Mapping[str, Any],
+    assim_cfg: Mapping[str, Any],
+    params: Mapping[str, Any],
+) -> Optional[Path]:
+    for source in (params, assim_cfg, resolved_cfg):
+        if not isinstance(source, Mapping):
+            continue
+        for key in ("obs_file", "observed_file", "observations_file", "obs_path"):
+            if key in source and source.get(key) is not None:
+                value = source.get(key)
+                if not isinstance(value, (str, Path)) or not str(value).strip():
+                    raise ConfigError("obs_file must be a non-empty string or Path.")
+                return resolve_repo_path(value)
+    return None
+
+
+def _extract_obs_columns(
+    assim_cfg: Mapping[str, Any],
+    params: Mapping[str, Any],
+) -> dict[str, str]:
+    columns: Any = None
+    for source in (params, assim_cfg):
+        if not isinstance(source, Mapping):
+            continue
+        if "obs_columns" in source:
+            columns = source.get("obs_columns")
+            break
+    if columns is None:
+        return {
+            "case_id": "case_id",
+            "observable": "observable",
+            "value": "value",
+            "sigma": "sigma",
+            "noise": "noise",
+            "weight": "weight",
+            "aggregate": "aggregate",
+        }
+    if not isinstance(columns, Mapping):
+        raise ConfigError("obs_columns must be a mapping.")
+    payload = {
+        "case_id": columns.get("case_id", "case_id"),
+        "observable": columns.get("observable", "observable"),
+        "value": columns.get("value", "value"),
+        "sigma": columns.get("sigma", "sigma"),
+        "noise": columns.get("noise", "noise"),
+        "weight": columns.get("weight", "weight"),
+        "aggregate": columns.get("aggregate", "aggregate"),
+    }
+    for key, value in payload.items():
+        if not isinstance(value, str) or not value.strip():
+            raise ConfigError(f"obs_columns.{key} must be a non-empty string.")
+        payload[key] = value.strip()
+    return payload
+
+
+def _extract_obs_mapping(
+    assim_cfg: Mapping[str, Any],
+    params: Mapping[str, Any],
+) -> dict[str, str]:
+    mapping: Any = None
+    for source in (params, assim_cfg):
+        if not isinstance(source, Mapping):
+            continue
+        for key in ("obs_mapping", "observable_map", "observed_map"):
+            if key in source:
+                mapping = source.get(key)
+                break
+        if mapping is not None:
+            break
+    if mapping is None:
+        return {}
+    if not isinstance(mapping, Mapping):
+        raise ConfigError("obs_mapping must be a mapping.")
+    result: dict[str, str] = {}
+    for key, value in mapping.items():
+        if not isinstance(key, str) or not key.strip():
+            raise ConfigError("obs_mapping keys must be non-empty strings.")
+        if not isinstance(value, str) or not value.strip():
+            raise ConfigError("obs_mapping values must be non-empty strings.")
+        result[key.strip()] = value.strip()
+    return result
+
+
+def _extract_conditions_file_settings(
+    resolved_cfg: Mapping[str, Any],
+    assim_cfg: Mapping[str, Any],
+    params: Mapping[str, Any],
+    sim_cfg: Mapping[str, Any],
+) -> tuple[Optional[Path], Optional[str], Optional[int], str]:
+    sources: list[Mapping[str, Any]] = []
+    for source in (params, assim_cfg, resolved_cfg, sim_cfg):
+        if isinstance(source, Mapping):
+            sources.append(source)
+        benchmarks = source.get("benchmarks") if isinstance(source, Mapping) else None
+        if isinstance(benchmarks, Mapping):
+            sources.append(benchmarks)
+
+    conditions_file: Optional[Any] = None
+    for source in sources:
+        for key in ("conditions_file", "conditions_path", "conditions_csv", "csv"):
+            if key in source and source.get(key) is not None:
+                conditions_file = source.get(key)
+                break
+        if conditions_file is not None:
+            break
+    if conditions_file is None:
+        return None, None, None, "case_id"
+    if not isinstance(conditions_file, (str, Path)) or not str(conditions_file).strip():
+        raise ConfigError("conditions_file must be a non-empty string or Path.")
+    conditions_path = resolve_repo_path(conditions_file)
+
+    case_id: Optional[str] = None
+    row_index: Optional[int] = None
+    case_col: Optional[str] = None
+    for source in sources:
+        if case_id is None:
+            for key in ("case_id", "condition_id", "case"):
+                if key in source and source.get(key) is not None:
+                    value = source.get(key)
+                    if not isinstance(value, str) or not value.strip():
+                        raise ConfigError("case_id must be a non-empty string.")
+                    case_id = value.strip()
+                    break
+        if row_index is None and "row_index" in source:
+            value = source.get("row_index")
+            if isinstance(value, bool):
+                raise ConfigError("row_index must be an integer.")
+            try:
+                row_index = int(value)
+            except (TypeError, ValueError) as exc:
+                raise ConfigError("row_index must be an integer.") from exc
+        if case_col is None:
+            for key in ("case_column", "case_col", "case_field"):
+                if key in source and source.get(key) is not None:
+                    case_col = source.get(key)
+                    break
+        if case_id is not None and row_index is not None and case_col is not None:
+            break
+    if case_col is None:
+        case_col = "case_id"
+    if not isinstance(case_col, str) or not case_col.strip():
+        raise ConfigError("case_column must be a non-empty string.")
+    case_col = case_col.strip()
+    return conditions_path, case_id, row_index, case_col
+
+
+def _select_csv_row(
+    rows: list[dict[str, str]],
+    *,
+    case_id: Optional[str],
+    row_index: Optional[int],
+    case_col: str,
+) -> dict[str, str]:
+    if case_id:
+        for row in rows:
+            if row.get(case_col) == case_id:
+                return row
+        raise ConfigError(f"case_id {case_id!r} not found in conditions file.")
+    if row_index is None:
+        row_index = 0
+    if row_index < 0 or row_index >= len(rows):
+        raise ConfigError("row_index out of range for conditions file.")
+    return rows[row_index]
+
+
+def _apply_conditions_file_to_sim(
+    sim_cfg: Mapping[str, Any],
+    *,
+    resolved_cfg: Mapping[str, Any],
+    assim_cfg: Mapping[str, Any],
+    params: Mapping[str, Any],
+) -> dict[str, Any]:
+    settings = _extract_conditions_file_settings(resolved_cfg, assim_cfg, params, sim_cfg)
+    conditions_path, case_id, row_index, case_col = settings
+    if conditions_path is None:
+        return dict(sim_cfg)
+    rows = _load_csv_rows(conditions_path)
+    row = _select_csv_row(rows, case_id=case_id, row_index=row_index, case_col=case_col)
+
+    def _pick(keys: Sequence[str]) -> Optional[str]:
+        for key in keys:
+            if key in row and row.get(key) is not None:
+                value = row.get(key)
+                if isinstance(value, str) and not value.strip():
+                    return None
+                return value
+        return None
+
+    def _optional_float(value: Any, label: str) -> Optional[float]:
+        if value is None:
+            return None
+        if isinstance(value, str) and not value.strip():
+            return None
+        return _coerce_float(value, label)
+
+    temperature = _optional_float(_pick(("T0", "T", "temperature")), "temperature")
+    pressure_atm = _optional_float(
+        _pick(("P0_atm", "P_atm", "P0", "pressure_atm", "pressure")),
+        "pressure_atm",
+    )
+    phi = _optional_float(_pick(("phi",)), "phi")
+    t_end = _optional_float(_pick(("t_end", "t_end_s", "t_end_seconds")), "t_end")
+    row_case_id = row.get(case_col) if case_col in row else None
+    if isinstance(row_case_id, str) and not row_case_id.strip():
+        row_case_id = None
+    if case_id is None and row_case_id is not None:
+        case_id = row_case_id
+
+    return _apply_csv_condition(
+        sim_cfg,
+        temperature=temperature,
+        pressure_atm=pressure_atm,
+        phi=phi,
+        t_end=t_end,
+        case_id=case_id,
+    )
+
+
+def _load_observed_rows_from_file(
+    obs_path: Path,
+    *,
+    case_id: Optional[str],
+    columns: Mapping[str, str],
+    mapping: Mapping[str, str],
+) -> list[dict[str, Any]]:
+    rows = _load_csv_rows(obs_path)
+    selected: list[dict[str, Any]] = []
+    case_col = columns.get("case_id", "case_id")
+    obs_col = columns.get("observable", "observable")
+    value_col = columns.get("value", "value")
+    sigma_col = columns.get("sigma", "sigma")
+    noise_col = columns.get("noise", "noise")
+    weight_col = columns.get("weight", "weight")
+    aggregate_col = columns.get("aggregate", "aggregate")
+
+    for row in rows:
+        if case_id is not None and case_col in row and row.get(case_col) != case_id:
+            continue
+        target = row.get(obs_col)
+        if target is None or (isinstance(target, str) and not target.strip()):
+            raise ConfigError("obs_file rows must include observable values.")
+        target_name = str(target)
+        if target_name in mapping:
+            target_name = mapping[target_name]
+        value = row.get(value_col)
+        if isinstance(value, str) and not value.strip():
+            value = None
+        sigma = row.get(noise_col)
+        if sigma is None:
+            sigma = row.get(sigma_col)
+        if isinstance(sigma, str) and not sigma.strip():
+            sigma = None
+        weight = row.get(weight_col)
+        if isinstance(weight, str) and not weight.strip():
+            weight = None
+        aggregate = row.get(aggregate_col)
+        payload: dict[str, Any] = {
+            "observable": target_name,
+            "value": _coerce_float(value, "observed.value"),
+        }
+        if sigma is not None:
+            payload["noise"] = _coerce_optional_float(sigma, "observed.noise", default=1.0)
+        if weight is not None:
+            payload["weight"] = _coerce_optional_float(weight, "observed.weight", default=1.0)
+        if aggregate is not None and str(aggregate).strip():
+            payload["aggregate"] = str(aggregate).strip()
+        selected.append(payload)
+
+    if not selected:
+        raise ConfigError("No observations matched obs_file filters.")
+    return selected
 
 
 def _normalize_observables_cfg(
@@ -510,6 +819,8 @@ def _extract_observed_rows(
     resolved_cfg: Mapping[str, Any],
     assim_cfg: Mapping[str, Any],
     params: Mapping[str, Any],
+    *,
+    sim_cfg: Optional[Mapping[str, Any]] = None,
 ) -> list[dict[str, Any]]:
     observed: Any = None
     for source in (params, assim_cfg, resolved_cfg):
@@ -523,6 +834,18 @@ def _extract_observed_rows(
             break
     if observed is not None:
         return _coerce_rows(observed, "observed")
+
+    obs_path = _extract_obs_file(resolved_cfg, assim_cfg, params)
+    if obs_path is not None:
+        case_id = _extract_case_id(resolved_cfg, assim_cfg, params, sim_cfg)
+        columns = _extract_obs_columns(assim_cfg, params)
+        mapping = _extract_obs_mapping(assim_cfg, params)
+        return _load_observed_rows_from_file(
+            obs_path,
+            case_id=case_id,
+            columns=columns,
+            mapping=mapping,
+        )
 
     observed_id: Any = None
     observed_run_id: Any = None
@@ -634,23 +957,6 @@ def _coerce_rows(value: Any, label: str) -> list[dict[str, Any]]:
             rows.append(dict(entry))
         return rows
     raise ConfigError(f"{label} must be a mapping or sequence of mappings.")
-
-
-def _read_table_rows(path: Path) -> list[dict[str, Any]]:
-    if pd is not None:
-        try:
-            frame = pd.read_parquet(path)
-            return frame.to_dict(orient="records")
-        except Exception:
-            pass
-    if pq is not None:
-        try:
-            table = pq.read_table(path)
-            return table.to_pylist()
-        except Exception:
-            pass
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    return list(payload.get("rows", []))
 
 
 def _build_multiplier_map(entries: Sequence[Mapping[str, Any]]) -> dict[tuple[str, Any], float]:
@@ -1161,7 +1467,7 @@ def _read_json_mapping(path: Path, label: str) -> dict[str, Any]:
     if not path.exists():
         raise ConfigError(f"{label} not found: {path}")
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = read_json(path)
     except json.JSONDecodeError as exc:
         raise ConfigError(f"{label} is not valid JSON: {exc}") from exc
     if not isinstance(payload, Mapping):
@@ -1761,10 +2067,7 @@ def _write_table(
         pq.write_table(table, path)
         return
     payload = {"columns": columns, "rows": list(rows)}
-    path.write_text(
-        json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    write_json_atomic(path, payload)
     logger = logging.getLogger("rxn_platform.assimilation")
     logger.warning(
         "Parquet writer unavailable; stored JSON payload at %s.",
@@ -1887,7 +2190,13 @@ def run_eki(
         missing_strategy=missing_strategy,
     )
 
-    observed_rows = _extract_observed_rows(store, resolved_cfg, assim_cfg, params)
+    observed_rows = _extract_observed_rows(
+        store,
+        resolved_cfg,
+        assim_cfg,
+        params,
+        sim_cfg=sim_cfg,
+    )
     columns = _extract_columns(assim_cfg, params)
     default_aggregate = _extract_default_aggregate(assim_cfg, params)
 
@@ -2144,28 +2453,19 @@ def run_eki(
     if laplacian_regularizer is not None:
         parent_candidates.append(laplacian_regularizer.graph_id)
     parents = _dedupe_preserve(parent_candidates)
-    manifest = ArtifactManifest(
-        schema_version=1,
+    manifest = build_manifest(
         kind="assimilation",
-        id=artifact_id,
-        created_at=_utc_now_iso(),
+        artifact_id=artifact_id,
         parents=parents,
         inputs=inputs_payload,
         config=manifest_cfg,
-        code=_code_metadata(),
-        provenance=_provenance_metadata(),
         notes=notes or None,
     )
 
     def _writer(base_dir: Path) -> None:
-        (base_dir / "parameter_vector.json").write_text(
-            json.dumps(
-                {"parameters": parameter_vector.to_payload()},
-                ensure_ascii=True,
-                sort_keys=True,
-            )
-            + "\n",
-            encoding="utf-8",
+        write_json_atomic(
+            base_dir / "parameter_vector.json",
+            {"parameters": parameter_vector.to_payload()},
         )
         _write_table(posterior_rows, base_dir / "posterior.parquet", REQUIRED_POSTERIOR_COLUMNS)
         _write_table(
@@ -2175,6 +2475,30 @@ def run_eki(
         )
 
     return store.ensure(manifest, writer=_writer)
+
+
+def run_eki_csv(
+    cfg: Mapping[str, Any],
+    *,
+    store: ArtifactStore,
+    registry: Optional[Registry] = None,
+) -> ArtifactCacheResult:
+    """Run EKI with a sim config resolved from a conditions CSV row."""
+    if not isinstance(cfg, Mapping):
+        raise ConfigError("cfg must be a mapping.")
+    resolved_cfg = _resolve_cfg(cfg)
+    _, assim_cfg = _extract_assim_cfg(resolved_cfg)
+    params = _extract_params(assim_cfg)
+    sim_cfg = _extract_sim_cfg(resolved_cfg, assim_cfg, params)
+    updated_sim_cfg = _apply_conditions_file_to_sim(
+        sim_cfg,
+        resolved_cfg=resolved_cfg,
+        assim_cfg=assim_cfg,
+        params=params,
+    )
+    updated_cfg = dict(resolved_cfg)
+    updated_cfg["sim"] = updated_sim_cfg
+    return run_eki(updated_cfg, store=store, registry=registry)
 
 
 def run_esmda(
@@ -2203,7 +2527,13 @@ def run_esmda(
         missing_strategy=missing_strategy,
     )
 
-    observed_rows = _extract_observed_rows(store, resolved_cfg, assim_cfg, params)
+    observed_rows = _extract_observed_rows(
+        store,
+        resolved_cfg,
+        assim_cfg,
+        params,
+        sim_cfg=sim_cfg,
+    )
     columns = _extract_columns(assim_cfg, params)
     default_aggregate = _extract_default_aggregate(assim_cfg, params)
 
@@ -2484,28 +2814,19 @@ def run_esmda(
     if laplacian_regularizer is not None:
         parent_candidates.append(laplacian_regularizer.graph_id)
     parents = _dedupe_preserve(parent_candidates)
-    manifest = ArtifactManifest(
-        schema_version=1,
+    manifest = build_manifest(
         kind="assimilation",
-        id=artifact_id,
-        created_at=_utc_now_iso(),
+        artifact_id=artifact_id,
         parents=parents,
         inputs=inputs_payload,
         config=manifest_cfg,
-        code=_code_metadata(),
-        provenance=_provenance_metadata(),
         notes=notes or None,
     )
 
     def _writer(base_dir: Path) -> None:
-        (base_dir / "parameter_vector.json").write_text(
-            json.dumps(
-                {"parameters": parameter_vector.to_payload()},
-                ensure_ascii=True,
-                sort_keys=True,
-            )
-            + "\n",
-            encoding="utf-8",
+        write_json_atomic(
+            base_dir / "parameter_vector.json",
+            {"parameters": parameter_vector.to_payload()},
         )
         _write_table(posterior_rows, base_dir / "posterior.parquet", REQUIRED_POSTERIOR_COLUMNS)
         _write_table(
@@ -2515,6 +2836,30 @@ def run_esmda(
         )
 
     return store.ensure(manifest, writer=_writer)
+
+
+def run_esmda_csv(
+    cfg: Mapping[str, Any],
+    *,
+    store: ArtifactStore,
+    registry: Optional[Registry] = None,
+) -> ArtifactCacheResult:
+    """Run ES-MDA with a sim config resolved from a conditions CSV row."""
+    if not isinstance(cfg, Mapping):
+        raise ConfigError("cfg must be a mapping.")
+    resolved_cfg = _resolve_cfg(cfg)
+    _, assim_cfg = _extract_assim_cfg(resolved_cfg)
+    params = _extract_params(assim_cfg)
+    sim_cfg = _extract_sim_cfg(resolved_cfg, assim_cfg, params)
+    updated_sim_cfg = _apply_conditions_file_to_sim(
+        sim_cfg,
+        resolved_cfg=resolved_cfg,
+        assim_cfg=assim_cfg,
+        params=params,
+    )
+    updated_cfg = dict(resolved_cfg)
+    updated_cfg["sim"] = updated_sim_cfg
+    return run_esmda(updated_cfg, store=store, registry=registry)
 
 
 class EkiTask(Task):
@@ -2533,6 +2878,22 @@ class EkiTask(Task):
 register("task", "assimilation.eki", EkiTask())
 
 
+class EkiCsvTask(Task):
+    name = "assimilation.eki_csv"
+
+    def run(
+        self,
+        cfg: Mapping[str, Any],
+        *,
+        store: ArtifactStore,
+        registry: Optional[Registry] = None,
+    ) -> ArtifactCacheResult:
+        return run_eki_csv(cfg, store=store, registry=registry)
+
+
+register("task", "assimilation.eki_csv", EkiCsvTask())
+
+
 class EsmdaTask(Task):
     name = "assimilation.esmda"
 
@@ -2547,6 +2908,22 @@ class EsmdaTask(Task):
 
 
 register("task", "assimilation.esmda", EsmdaTask())
+
+
+class EsmdaCsvTask(Task):
+    name = "assimilation.esmda_csv"
+
+    def run(
+        self,
+        cfg: Mapping[str, Any],
+        *,
+        store: ArtifactStore,
+        registry: Optional[Registry] = None,
+    ) -> ArtifactCacheResult:
+        return run_esmda_csv(cfg, store=store, registry=registry)
+
+
+register("task", "assimilation.esmda_csv", EsmdaCsvTask())
 
 
 def write_assimilation_artifact(
@@ -2573,28 +2950,19 @@ def write_assimilation_artifact(
         code=_code_metadata(),
         exclude_keys=("hydra",),
     )
-    manifest = ArtifactManifest(
-        schema_version=1,
+    manifest = build_manifest(
         kind="assimilation",
-        id=artifact_id,
-        created_at=_utc_now_iso(),
+        artifact_id=artifact_id,
         parents=list(parents or []),
         inputs=inputs_payload,
-        config=dict(manifest_cfg),
-        code=_code_metadata(),
-        provenance=_provenance_metadata(),
+        config=manifest_cfg,
         notes=notes,
     )
 
     def _writer(base_dir: Path) -> None:
-        (base_dir / "parameter_vector.json").write_text(
-            json.dumps(
-                {"parameters": parameter_vector.to_payload()},
-                ensure_ascii=True,
-                sort_keys=True,
-            )
-            + "\n",
-            encoding="utf-8",
+        write_json_atomic(
+            base_dir / "parameter_vector.json",
+            {"parameters": parameter_vector.to_payload()},
         )
         if sample_list is not None:
             rows = []
@@ -2606,15 +2974,9 @@ def write_assimilation_artifact(
                         "params": {name: float(value) for name, value in zip(names, values)},
                     }
                 )
-            (base_dir / "prior_samples.json").write_text(
-                json.dumps({"samples": rows}, ensure_ascii=True, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
+            write_json_atomic(base_dir / "prior_samples.json", {"samples": rows})
         if misfit is not None:
-            (base_dir / "misfit.json").write_text(
-                json.dumps(misfit.to_dict(), ensure_ascii=True, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
+            write_json_atomic(base_dir / "misfit.json", misfit.to_dict())
         logger = logging.getLogger("rxn_platform.assimilation")
         if samples is not None and (pd is None or pq is None):
             logger.debug("Stored assimilation samples as JSON (parquet unavailable).")

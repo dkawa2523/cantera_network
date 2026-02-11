@@ -1,0 +1,41 @@
+# @package _global_
+defaults:
+  - override /pipeline: eval_mapping
+  - _self_
+
+recipe:
+  name: eval_mapping
+  description: Evaluate mapping quality and compare GNN vs CNR.
+
+exp: eval
+compare: {}
+
+eval_mapping:
+  gnn:
+    run_id: ${run_id}
+    exp: default
+    run_root: null
+    store_root: null
+    mapping_id: null
+    graph_id: null
+    mapping_step: mapping
+    graph_step: graph
+  compare:
+    run_id: ${compare}
+    exp: default
+    run_root: null
+    store_root: null
+    mapping_id: null
+    graph_id: null
+    mapping_step: mapping
+    graph_step: graph
+  qoi:
+    selector: all
+    window_ids: []
+    window_radius: 0
+  symmetrize: null
+  viz:
+    max_bins: 20
+  report:
+    format: markdown
+    max_windows: 12

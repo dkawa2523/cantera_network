@@ -27,7 +27,7 @@ except ImportError:  # pragma: no cover - optional dependency
     np = None
 
 DEFAULT_CONFIG_PATH = "configs"
-DEFAULT_CONFIG_NAME = "defaults"
+DEFAULT_CONFIG_NAME = "default"
 DEFAULT_SEED_PATHS = ("common.seed", "seed")
 
 
@@ -39,7 +39,66 @@ def _require_hydra() -> None:
 def _normalize_overrides(overrides: Optional[Sequence[str]]) -> list[str]:
     if not overrides:
         return []
-    return [item for item in overrides if item and item != "--"]
+    normalized: list[str] = []
+    skip_next = False
+    for idx, item in enumerate(overrides):
+        if skip_next:
+            skip_next = False
+            continue
+        if not item or item == "--":
+            continue
+        if item.startswith("--use_surrogate"):
+            if item == "--use_surrogate":
+                value = "true"
+                if idx + 1 < len(overrides):
+                    candidate = overrides[idx + 1]
+                    if candidate and not candidate.startswith("-") and "=" not in candidate:
+                        value = candidate
+                        skip_next = True
+                normalized.append(f"use_surrogate={value}")
+            else:
+                if "=" in item:
+                    _, value = item.split("=", 1)
+                    value = value or "true"
+                else:
+                    value = "true"
+                normalized.append(f"use_surrogate={value}")
+            continue
+        if item == "--clearml" or item.startswith("--clearml="):
+            if item == "--clearml":
+                value = "true"
+                if idx + 1 < len(overrides):
+                    candidate = overrides[idx + 1]
+                    if candidate and not candidate.startswith("-") and "=" not in candidate:
+                        value = candidate
+                        skip_next = True
+                normalized.append(f"clearml={value}")
+            else:
+                _, value = item.split("=", 1)
+                value = value or "true"
+                normalized.append(f"clearml={value}")
+            continue
+        if (
+            item in {"--dry_run", "--dry-run"}
+            or item.startswith("--dry_run=")
+            or item.startswith("--dry-run=")
+        ):
+            flag = "--dry_run" if item.startswith("--dry_run") else "--dry-run"
+            if item == flag:
+                value = "true"
+                if idx + 1 < len(overrides):
+                    candidate = overrides[idx + 1]
+                    if candidate and not candidate.startswith("-") and "=" not in candidate:
+                        value = candidate
+                        skip_next = True
+                normalized.append(f"dry_run={value}")
+            else:
+                _, value = item.split("=", 1)
+                value = value or "true"
+                normalized.append(f"dry_run={value}")
+            continue
+        normalized.append(item)
+    return normalized
 
 
 def _normalize_config_name(config_name: str) -> str:
@@ -55,6 +114,11 @@ def compose_config(
     overrides: Optional[Sequence[str]] = None,
 ) -> Any:
     _require_hydra()
+    try:
+        from rxn_platform.config.schema import register_configs
+    except Exception as exc:  # pragma: no cover - config registration should be safe
+        raise ConfigError(f"Failed to load structured config registry: {exc}") from exc
+    register_configs()
     config_dir = Path(config_path)
     if not config_dir.is_absolute():
         config_dir = (Path.cwd() / config_dir).resolve()
@@ -104,7 +168,7 @@ def _select_from_mapping(cfg: Mapping[str, Any], path: str) -> Any:
 
 
 def _extract_seed(cfg: Any, seed_paths: Sequence[str]) -> Optional[int]:
-    if OmegaConf is not None:
+    if OmegaConf is not None and OmegaConf.is_config(cfg):
         for path in seed_paths:
             value = OmegaConf.select(cfg, path, default=None)
             if value is not None:

@@ -1,0 +1,35 @@
+# Benchmarks + platform runtime dependencies (best-effort, non-pinned)
+# Install:
+#   pip install -r requirements/benchmarks.txt
+#
+# NOTE:
+# - Cantera install can be easier with conda (see env/environment.yml)
+# - If your project already specifies dependencies in pyproject.toml, you may not need all of these.
+
+# Core scientific stack
+numpy
+scipy
+pandas
+xarray
+zarr
+pyyaml
+pyarrow
+
+# Platform plumbing (Hydra / config / typing)
+pydantic>=2
+hydra-core
+omegaconf
+
+# Graph / analysis
+networkx
+
+# CLI / UX
+typer
+rich
+tqdm
+
+# Visualization
+plotly
+
+# Simulation
+cantera

@@ -1,0 +1,6 @@
+# Benchmark case: gri30_netbench_val
+case_name: gri30_netbench_val
+conditions_file: benchmarks/assets/conditions/gri30_netbench_val.csv
+validation_conditions_file: benchmarks/assets/conditions/gri30_netbench_val.csv
+# Default single-case selection for sim.run_csv
+case_id: va000

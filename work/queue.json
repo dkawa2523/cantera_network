@@ -1,1345 +1,538 @@
-[
-  {
-    "id": "T001",
-    "priority": 0,
-    "status": "done",
-    "title": "Repo reconnaissance: 既存Cantera実行例/出力/構造を調査し docs TODO を埋める",
-    "path": "work/tasks/T001_repo_reconnaissance.md",
-    "skills": [
-      "repo-audit",
-      "docs"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md",
-      "docs/01_ARCHITECTURE.md",
-      "docs/02_ARTIFACT_CONTRACTS.md"
-    ]
-  },
-  {
-    "id": "T002",
-    "priority": 0,
-    "status": "done",
-    "title": "Bootstrap scaffold: package骨格・artifacts/work/configs/tests最小整備",
-    "path": "work/tasks/T002_bootstrap_scaffold.md",
-    "skills": [
-      "python",
-      "repo-scaffolding"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md",
-      "docs/01_ARCHITECTURE.md"
-    ],
-    "depends_on": [
-      "T001"
-    ]
-  },
-  {
-    "id": "T003",
-    "priority": 0,
-    "status": "done",
-    "title": "Core schema: Manifestモデル（pydantic）+ YAML I/O + schema_version",
-    "path": "work/tasks/T003_core_manifest_schema.md",
-    "skills": [
-      "python",
-      "pydantic"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md",
-      "docs/02_ARTIFACT_CONTRACTS.md"
-    ],
-    "depends_on": [
-      "T002"
-    ]
-  },
-  {
-    "id": "T004",
-    "priority": 0,
-    "status": "done",
-    "title": "Core IDs: config正規化・hash・run_id/artifact_idの安定生成",
-    "path": "work/tasks/T004_core_id_hashing.md",
-    "skills": [
-      "python",
-      "hashing"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md",
-      "docs/03_CONFIG_CONVENTIONS.md"
-    ],
-    "depends_on": [
-      "T003"
-    ]
-  },
-  {
-    "id": "T005",
-    "priority": 0,
-    "status": "done",
-    "title": "ArtifactStore v1: layout/atomic write/read/immutability enforcement",
-    "path": "work/tasks/T005_artifact_store_v1.md",
-    "skills": [
-      "python",
-      "artifacts"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md",
-      "docs/02_ARTIFACT_CONTRACTS.md"
-    ],
-    "depends_on": [
-      "T004"
-    ]
-  },
-  {
-    "id": "T006",
-    "priority": 0,
-    "status": "done",
-    "title": "ArtifactStore v2: provenance/parents/再利用キャッシュ補助API",
-    "path": "work/tasks/T006_artifact_store_v2_cache.md",
-    "skills": [
-      "python",
-      "artifacts"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md",
-      "docs/02_ARTIFACT_CONTRACTS.md"
-    ],
-    "depends_on": [
-      "T005"
-    ]
-  },
-  {
-    "id": "T007",
-    "priority": 0,
-    "status": "done",
-    "title": "Registry: backend/task/observable/feature/viz のプラグイン登録・解決",
-    "path": "work/tasks/T007_registry_plugins.md",
-    "skills": [
-      "python",
-      "plugin-system"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md",
-      "docs/01_ARCHITECTURE.md"
-    ],
-    "depends_on": [
-      "T003",
-      "T005"
-    ]
-  },
-  {
-    "id": "T008",
-    "priority": 0,
-    "status": "done",
-    "title": "Error/Logging policy: 例外階層・ユーザ向けエラー・ログ出力規約を実装",
-    "path": "work/tasks/T008_error_logging_policy.md",
-    "skills": [
-      "python",
-      "logging"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md",
-      "docs/07_CONTRIBUTING.md"
-    ],
-    "depends_on": [
-      "T003"
-    ]
-  },
-  {
-    "id": "T009",
-    "priority": 0,
-    "status": "done",
-    "title": "CLI v0: sim/task/pipeline/viz/doctor の枠だけ作り --help を固定",
-    "path": "work/tasks/T009_cli_v0.md",
-    "skills": [
-      "python",
-      "cli"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md",
-      "docs/03_CONFIG_CONVENTIONS.md"
-    ],
-    "depends_on": [
-      "T007",
-      "T008"
-    ]
-  },
-  {
-    "id": "T010",
-    "priority": 0,
-    "status": "done",
-    "title": "Hydra integration: config compose/override/--cfg表示 + 実行設定をmanifestへ保存",
-    "path": "work/tasks/T010_hydra_integration.md",
-    "skills": [
-      "python",
-      "hydra"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md",
-      "docs/03_CONFIG_CONVENTIONS.md"
-    ],
-    "depends_on": [
-      "T009",
-      "T004"
-    ]
-  },
-  {
-    "id": "T011",
-    "priority": 0,
-    "status": "done",
-    "title": "Backend IF + DummyBackend: SimulationBackend差し替え点と超高速ダミー実装",
-    "path": "work/tasks/T011_backend_dummy.md",
-    "skills": [
-      "python",
-      "simulation"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md",
-      "docs/02_ARTIFACT_CONTRACTS.md"
-    ],
-    "depends_on": [
-      "T005",
-      "T007"
-    ]
-  },
-  {
-    "id": "T012",
-    "priority": 0,
-    "status": "done",
-    "title": "Task runner: registryからTaskを解決し単体実行できるrunnerを実装",
-    "path": "work/tasks/T012_task_runner.md",
-    "skills": [
-      "python",
-      "task-runner"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md",
-      "docs/04_PIPELINES.md"
-    ],
-    "depends_on": [
-      "T007",
-      "T005",
-      "T010"
-    ]
-  },
-  {
-    "id": "T013",
-    "priority": 0,
-    "status": "done",
-    "title": "Pipeline runner v0: steps YAML を逐次実行しArtifactをつなぐ（最小）",
-    "path": "work/tasks/T013_pipeline_runner_v0.md",
-    "skills": [
-      "python",
-      "pipeline"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md",
-      "docs/04_PIPELINES.md"
-    ],
-    "depends_on": [
-      "T012"
-    ]
-  },
-  {
-    "id": "T014",
-    "priority": 0,
-    "status": "done",
-    "title": "Pipeline runner v1: @id/@last参照・step timing・pipeline manifest出力",
-    "path": "work/tasks/T014_pipeline_runner_v1.md",
-    "skills": [
-      "python",
-      "pipeline"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md",
-      "docs/04_PIPELINES.md"
-    ],
-    "depends_on": [
-      "T013"
-    ]
-  },
-  {
-    "id": "T015",
-    "priority": 0,
-    "status": "done",
-    "title": "Configs: dummy sim + smoke pipeline + task configs のサンプル追加",
-    "path": "work/tasks/T015_configs_examples.md",
-    "skills": [
-      "yaml",
-      "hydra"
-    ],
-    "contracts": [
-      "docs/03_CONFIG_CONVENTIONS.md"
-    ],
-    "depends_on": [
-      "T014",
-      "T011"
-    ]
-  },
-  {
-    "id": "T016",
-    "priority": 0,
-    "status": "done",
-    "title": "Tests: dummy smoke pipeline integration test（pytest）",
-    "path": "work/tasks/T016_tests_smoke_dummy.md",
-    "skills": [
-      "python",
-      "pytest"
-    ],
-    "contracts": [
-      "docs/06_TESTING_AND_QA.md"
-    ],
-    "depends_on": [
-      "T015"
-    ]
-  },
-  {
-    "id": "T017",
-    "priority": 0,
-    "status": "done",
-    "title": "Doctor: 環境診断コマンド（dummy smoke含む）",
-    "path": "work/tasks/T017_doctor_command.md",
-    "skills": [
-      "python",
-      "qa"
-    ],
-    "contracts": [
-      "docs/06_TESTING_AND_QA.md"
-    ],
-    "depends_on": [
-      "T016",
-      "T009"
-    ]
-  },
-  {
-    "id": "T018",
-    "priority": 0,
-    "status": "done",
-    "title": "Report base: ReportArtifact（HTMLテンプレ）と共通ヘッダ/メタ埋め込み",
-    "path": "work/tasks/T018_report_base.md",
-    "skills": [
-      "python",
-      "reporting"
-    ],
-    "contracts": [
-      "docs/05_VISUALIZATION_STANDARDS.md",
-      "docs/02_ARTIFACT_CONTRACTS.md"
-    ],
-    "depends_on": [
-      "T005",
-      "T012"
-    ]
-  },
-  {
-    "id": "T019",
-    "priority": 0,
-    "status": "done",
-    "title": "Artifacts CLI: artifacts ls/show/export（開発者が成果物を追える）",
-    "path": "work/tasks/T019_artifacts_cli.md",
-    "skills": [
-      "python",
-      "cli"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md",
-      "docs/02_ARTIFACT_CONTRACTS.md"
-    ],
-    "depends_on": [
-      "T009",
-      "T005"
-    ]
-  },
-  {
-    "id": "T020",
-    "priority": 0,
-    "status": "done",
-    "title": "Contract validators: Run/Observable/Graph/Feature/Sensitivityの整合チェック関数",
-    "path": "work/tasks/T020_contract_validators.md",
-    "skills": [
-      "python",
-      "validation"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md",
-      "docs/02_ARTIFACT_CONTRACTS.md"
-    ],
-    "depends_on": [
-      "T003",
-      "T005"
-    ]
-  },
-  {
-    "id": "T020G",
-    "priority": 0,
-    "status": "done",
-    "title": "Phase Gate P0→P1: P0全体の仕様準拠・統合テスト・修正/軽リファクタ",
-    "path": "work/tasks/T020G_phase_gate_p0.md",
-    "skills": [
-      "python",
-      "qa",
-      "refactor"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md",
-      "docs/02_ARTIFACT_CONTRACTS.md",
-      "docs/03_CONFIG_CONVENTIONS.md"
-    ],
-    "depends_on": [
-      "T001",
-      "T002",
-      "T003",
-      "T004",
-      "T005",
-      "T006",
-      "T007",
-      "T008",
-      "T009",
-      "T010",
-      "T011",
-      "T012",
-      "T013",
-      "T014",
-      "T015",
-      "T016",
-      "T017",
-      "T018",
-      "T019",
-      "T020"
-    ],
-    "unblocks": [
-      "T021",
-      "T022",
-      "T023",
-      "T024",
-      "T025",
-      "T026",
-      "T027",
-      "T028",
-      "T029",
-      "T030",
-      "T031",
-      "T032",
-      "T033",
-      "T034",
-      "T035",
-      "T036",
-      "T037",
-      "T038",
-      "T039",
-      "T040"
-    ]
-  },
-  {
-    "id": "T021",
-    "priority": 1,
-    "status": "done",
-    "title": "CanteraBackend v0: 0D実行（T/P/X, time grid）でRunArtifact生成",
-    "path": "work/tasks/T021_backend_cantera_v0.md",
-    "skills": [
-      "python",
-      "cantera",
-      "xarray"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md",
-      "docs/02_ARTIFACT_CONTRACTS.md"
-    ],
-    "depends_on": [
-      "T011",
-      "T010",
-      "T020G"
-    ]
-  },
-  {
-    "id": "T022",
-    "priority": 1,
-    "status": "done",
-    "title": "Cantera outputs拡張: wdot/rop_net/creation/destruction 等を可能な範囲で保存",
-    "path": "work/tasks/T022_backend_cantera_outputs.md",
-    "skills": [
-      "python",
-      "cantera"
-    ],
-    "contracts": [
-      "docs/02_ARTIFACT_CONTRACTS.md"
-    ],
-    "depends_on": [
-      "T021",
-      "T020",
-      "T020G"
-    ]
-  },
-  {
-    "id": "T023",
-    "priority": 1,
-    "status": "done",
-    "title": "Cantera parameterization: reaction multipliers（摂動/無効化）適用とmanifest記録",
-    "path": "work/tasks/T023_backend_cantera_multipliers.md",
-    "skills": [
-      "python",
-      "cantera"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md",
-      "docs/02_ARTIFACT_CONTRACTS.md"
-    ],
-    "depends_on": [
-      "T022",
-      "T020G"
-    ]
-  },
-  {
-    "id": "T024",
-    "priority": 1,
-    "status": "done",
-    "title": "sim コマンド: init/validate/run/viz（backend独立）+ キャッシュskip",
-    "path": "work/tasks/T024_sim_commands.md",
-    "skills": [
-      "python",
-      "cli",
-      "hydra"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md",
-      "docs/03_CONFIG_CONVENTIONS.md"
-    ],
-    "depends_on": [
-      "T023",
-      "T009",
-      "T015",
-      "T020G"
-    ]
-  },
-  {
-    "id": "T025",
-    "priority": 1,
-    "status": "done",
-    "title": "Observables framework: ObservableプラグインAPI + ObservableArtifact出力",
-    "path": "work/tasks/T025_observables_framework.md",
-    "skills": [
-      "python",
-      "domain-chemistry"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md",
-      "docs/02_ARTIFACT_CONTRACTS.md"
-    ],
-    "depends_on": [
-      "T012",
-      "T020",
-      "T020G"
-    ]
-  },
-  {
-    "id": "T026",
-    "priority": 1,
-    "status": "done",
-    "title": "Observable: gas_composition（指定種/集約）",
-    "path": "work/tasks/T026_observable_gas_composition.md",
-    "skills": [
-      "python",
-      "chemistry"
-    ],
-    "contracts": [
-      "docs/02_ARTIFACT_CONTRACTS.md"
-    ],
-    "depends_on": [
-      "T025",
-      "T020G"
-    ]
-  },
-  {
-    "id": "T027",
-    "priority": 1,
-    "status": "done",
-    "title": "Observable: coverage_summary（表面被覆率。無ければgraceful）",
-    "path": "work/tasks/T027_observable_coverage.md",
-    "skills": [
-      "python",
-      "chemistry"
-    ],
-    "contracts": [
-      "docs/02_ARTIFACT_CONTRACTS.md"
-    ],
-    "depends_on": [
-      "T025",
-      "T020G"
-    ]
-  },
-  {
-    "id": "T028",
-    "priority": 1,
-    "status": "done",
-    "title": "Observable: film_thickness v0（deposition_rate積分/簡易モデル）",
-    "path": "work/tasks/T028_observable_film_thickness.md",
-    "skills": [
-      "python",
-      "domain-chemistry"
-    ],
-    "contracts": [
-      "docs/02_ARTIFACT_CONTRACTS.md"
-    ],
-    "depends_on": [
-      "T025",
-      "T022",
-      "T020G"
-    ]
-  },
-  {
-    "id": "T029",
-    "priority": 1,
-    "status": "done",
-    "title": "Graphs v0: 機構からS行列（species×reaction）を作りGraphArtifact保存",
-    "path": "work/tasks/T029_graphs_stoich.md",
-    "skills": [
-      "python",
-      "sparse-matrix",
-      "chemistry"
-    ],
-    "contracts": [
-      "docs/02_ARTIFACT_CONTRACTS.md"
-    ],
-    "depends_on": [
-      "T021",
-      "T020",
-      "T020G"
-    ]
-  },
-  {
-    "id": "T030",
-    "priority": 1,
-    "status": "done",
-    "title": "Graphs v1: bipartite graph（species/reaction）を構築しJSON保存",
-    "path": "work/tasks/T030_graphs_bipartite.md",
-    "skills": [
-      "python",
-      "networkx"
-    ],
-    "contracts": [
-      "docs/02_ARTIFACT_CONTRACTS.md"
-    ],
-    "depends_on": [
-      "T029",
-      "T020G"
-    ]
-  },
-  {
-    "id": "T031",
-    "priority": 1,
-    "status": "done",
-    "title": "Graph annotation（species）: formula/elements/charge/state/phase を付与",
-    "path": "work/tasks/T031_graphs_species_annotation.md",
-    "skills": [
-      "python",
-      "chemistry"
-    ],
-    "contracts": [
-      "docs/02_ARTIFACT_CONTRACTS.md"
-    ],
-    "depends_on": [
-      "T030",
-      "T020G"
-    ]
-  },
-  {
-    "id": "T032",
-    "priority": 1,
-    "status": "done",
-    "title": "Graph annotation（reaction）: reaction_type/order/reversible 等を付与（unknown可）",
-    "path": "work/tasks/T032_graphs_reaction_annotation.md",
-    "skills": [
-      "python",
-      "chemistry"
-    ],
-    "contracts": [
-      "docs/02_ARTIFACT_CONTRACTS.md"
-    ],
-    "depends_on": [
-      "T030",
-      "T020G"
-    ]
-  },
-  {
-    "id": "T033",
-    "priority": 1,
-    "status": "done",
-    "title": "Graph analytics: SCC/communities/階層メトリクス算出（FeatureArtifactでも可）",
-    "path": "work/tasks/T033_graphs_analytics.md",
-    "skills": [
-      "python",
-      "graph-analysis"
-    ],
-    "contracts": [
-      "docs/02_ARTIFACT_CONTRACTS.md"
-    ],
-    "depends_on": [
-      "T031",
-      "T032",
-      "T020G"
-    ]
-  },
-  {
-    "id": "T034",
-    "priority": 1,
-    "status": "done",
-    "title": "Features framework + timeseries summary（mean/max/integral/last）",
-    "path": "work/tasks/T034_features_timeseries.md",
-    "skills": [
-      "python",
-      "pandas",
-      "xarray"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md",
-      "docs/02_ARTIFACT_CONTRACTS.md"
-    ],
-    "depends_on": [
-      "T012",
-      "T020",
-      "T020G"
-    ]
-  },
-  {
-    "id": "T035",
-    "priority": 1,
-    "status": "done",
-    "title": "Features: ROP/wdot summary（Top-N, time-integral）",
-    "path": "work/tasks/T035_features_rop_wdot.md",
-    "skills": [
-      "python",
-      "chemistry"
-    ],
-    "contracts": [
-      "docs/02_ARTIFACT_CONTRACTS.md"
-    ],
-    "depends_on": [
-      "T034",
-      "T022",
-      "T020G"
-    ]
-  },
-  {
-    "id": "T036",
-    "priority": 1,
-    "status": "done",
-    "title": "Features: graph/network metrics + 多条件安定性（rank stability等）",
-    "path": "work/tasks/T036_features_network_metrics.md",
-    "skills": [
-      "python",
-      "graph-analysis"
-    ],
-    "contracts": [
-      "docs/02_ARTIFACT_CONTRACTS.md"
-    ],
-    "depends_on": [
-      "T034",
-      "T033",
-      "T020G"
-    ]
-  },
-  {
-    "id": "T037",
-    "priority": 1,
-    "status": "done",
-    "title": "Sensitivity v0: multiplier finite-diff で target（Observable）感度を算出",
-    "path": "work/tasks/T037_sensitivity_multiplier_fd.md",
-    "skills": [
-      "python",
-      "simulation-orchestration"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md",
-      "docs/02_ARTIFACT_CONTRACTS.md"
-    ],
-    "depends_on": [
-      "T023",
-      "T025",
-      "T014",
-      "T020",
-      "T020G"
-    ]
-  },
-  {
-    "id": "T038",
-    "priority": 1,
-    "status": "done",
-    "title": "Sensitivity v1: virtual deletion（multiplier=0）+ キャッシュ + 条件間安定性",
-    "path": "work/tasks/T038_sensitivity_virtual_deletion.md",
-    "skills": [
-      "python",
-      "simulation-orchestration"
-    ],
-    "contracts": [
-      "docs/02_ARTIFACT_CONTRACTS.md"
-    ],
-    "depends_on": [
-      "T037",
-      "T020G"
-    ]
-  },
-  {
-    "id": "T039",
-    "priority": 1,
-    "status": "done",
-    "title": "Viz DS dashboard v0: 条件分布/目的変数/感度ヒートマップ/収束プレースホルダ",
-    "path": "work/tasks/T039_viz_ds_dashboard.md",
-    "skills": [
-      "python",
-      "plotly",
-      "reporting"
-    ],
-    "contracts": [
-      "docs/05_VISUALIZATION_STANDARDS.md"
-    ],
-    "depends_on": [
-      "T018",
-      "T025",
-      "T034",
-      "T037",
-      "T020G"
-    ]
-  },
-  {
-    "id": "T040",
-    "priority": 1,
-    "status": "done",
-    "title": "Viz Chem dashboard v0: species/ROP/ネットワークsubgraph/縮退差分プレースホルダ",
-    "path": "work/tasks/T040_viz_chem_dashboard.md",
-    "skills": [
-      "python",
-      "plotly",
-      "reporting"
-    ],
-    "contracts": [
-      "docs/05_VISUALIZATION_STANDARDS.md"
-    ],
-    "depends_on": [
-      "T018",
-      "T033",
-      "T035",
-      "T020G"
-    ]
-  },
-  {
-    "id": "T040G",
-    "priority": 1,
-    "status": "done",
-    "title": "Phase Gate P1→P2: Cantera/Graph/Feature/Sensitivity/Viz の統合テスト・修正/軽リファクタ",
-    "path": "work/tasks/T040G_phase_gate_p1.md",
-    "skills": [
-      "python",
-      "qa",
-      "integration"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md",
-      "docs/02_ARTIFACT_CONTRACTS.md",
-      "docs/05_VISUALIZATION_STANDARDS.md"
-    ],
-    "depends_on": [
-      "T021",
-      "T022",
-      "T023",
-      "T024",
-      "T025",
-      "T026",
-      "T027",
-      "T028",
-      "T029",
-      "T030",
-      "T031",
-      "T032",
-      "T033",
-      "T034",
-      "T035",
-      "T036",
-      "T037",
-      "T038",
-      "T039",
-      "T040",
-      "T020G"
-    ],
-    "unblocks": [
-      "T041",
-      "T042",
-      "T043",
-      "T044",
-      "T045",
-      "T046",
-      "T047",
-      "T048",
-      "T049",
-      "T050",
-      "T051",
-      "T052"
-    ]
-  },
-  {
-    "id": "T041",
-    "priority": 2,
-    "status": "done",
-    "title": "Optimization v0: random search（条件 or multipliers）+ history artifact",
-    "path": "work/tasks/T041_opt_random_search.md",
-    "skills": [
-      "python",
-      "optimization"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md",
-      "docs/02_ARTIFACT_CONTRACTS.md"
-    ],
-    "depends_on": [
-      "T024",
-      "T014",
-      "T025",
-      "T020",
-      "T040G"
-    ]
-  },
-  {
-    "id": "T042",
-    "priority": 2,
-    "status": "done",
-    "title": "Optimization v1: 多目的ベースライン（pareto archive / 簡易NSGA-II）",
-    "path": "work/tasks/T042_opt_multiobjective_baseline.md",
-    "skills": [
-      "python",
-      "optimization"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md"
-    ],
-    "depends_on": [
-      "T041",
-      "T040G"
-    ]
-  },
-  {
-    "id": "T043",
-    "priority": 2,
-    "status": "done",
-    "title": "Assimilation v0: パラメータ化（selected reactions）+ prior sampling + misfit/weights",
-    "path": "work/tasks/T043_assim_param_misfit.md",
-    "skills": [
-      "python",
-      "data-assimilation"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md",
-      "docs/02_ARTIFACT_CONTRACTS.md"
-    ],
-    "depends_on": [
-      "T025",
-      "T037",
-      "T020",
-      "T040G"
-    ]
-  },
-  {
-    "id": "T044",
-    "priority": 2,
-    "status": "done",
-    "title": "Assimilation v1: EKI baseline（pipeline rerun loop）+ PosteriorArtifact保存",
-    "path": "work/tasks/T044_assim_eki_baseline.md",
-    "skills": [
-      "python",
-      "data-assimilation",
-      "linear-algebra"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md",
-      "docs/02_ARTIFACT_CONTRACTS.md"
-    ],
-    "depends_on": [
-      "T043",
-      "T014",
-      "T024",
-      "T040G"
-    ]
-  },
-  {
-    "id": "T045",
-    "priority": 2,
-    "status": "done",
-    "title": "Assimilation v2: ES-MDA baseline（任意/オプション依存）",
-    "path": "work/tasks/T045_assim_esmda.md",
-    "skills": [
-      "python",
-      "data-assimilation"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md"
-    ],
-    "depends_on": [
-      "T044",
-      "T040G"
-    ]
-  },
-  {
-    "id": "T046",
-    "priority": 2,
-    "status": "done",
-    "title": "Reduction v0: mechanism patch schema（disable reaction / multiplier）+ apply",
-    "path": "work/tasks/T046_reduction_patch_schema.md",
-    "skills": [
-      "python",
-      "yaml",
-      "chemistry"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md",
-      "docs/02_ARTIFACT_CONTRACTS.md"
-    ],
-    "depends_on": [
-      "T029",
-      "T020",
-      "T040G"
-    ]
-  },
-  {
-    "id": "T047",
-    "priority": 2,
-    "status": "done",
-    "title": "Reduction v1: threshold prune（importance/sensitivity 기반）で反応削除候補生成",
-    "path": "work/tasks/T047_reduction_threshold_prune.md",
-    "skills": [
-      "python",
-      "chemistry"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md"
-    ],
-    "depends_on": [
-      "T046",
-      "T038",
-      "T040G"
-    ]
-  },
-  {
-    "id": "T048",
-    "priority": 2,
-    "status": "done",
-    "title": "Reduction v2: validation loop（縮退→再実行→差分評価）とValidationArtifact",
-    "path": "work/tasks/T048_reduction_validation_loop.md",
-    "skills": [
-      "python",
-      "qa",
-      "simulation-orchestration"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md",
-      "docs/06_TESTING_AND_QA.md"
-    ],
-    "depends_on": [
-      "T047",
-      "T024",
-      "T025",
-      "T034",
-      "T040G"
-    ]
-  },
-  {
-    "id": "T049",
-    "priority": 2,
-    "status": "done",
-    "title": "Reduction v3: node lumping prototype（元素/状態/電荷類似）+ mapping artifact",
-    "path": "work/tasks/T049_reduction_node_lumping.md",
-    "skills": [
-      "python",
-      "graph",
-      "chemistry"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md"
-    ],
-    "depends_on": [
-      "T046",
-      "T031",
-      "T040G"
-    ]
-  },
-  {
-    "id": "T050",
-    "priority": 2,
-    "status": "done",
-    "title": "Reduction v4: reaction lumping prototype（reaction_type内クラスタ）",
-    "path": "work/tasks/T050_reduction_reaction_lumping.md",
-    "skills": [
-      "python",
-      "graph",
-      "chemistry"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md"
-    ],
-    "depends_on": [
-      "T046",
-      "T032",
-      "T040G"
-    ]
-  },
-  {
-    "id": "T051",
-    "priority": 2,
-    "status": "done",
-    "title": "Golden suite: 代表条件セット + 回帰しきい値 + pytest回帰テスト",
-    "path": "work/tasks/T051_golden_suite_regression.md",
-    "skills": [
-      "python",
-      "pytest",
-      "qa"
-    ],
-    "contracts": [
-      "docs/06_TESTING_AND_QA.md"
-    ],
-    "depends_on": [
-      "T016",
-      "T048",
-      "T040G"
-    ]
-  },
-  {
-    "id": "T052",
-    "priority": 2,
-    "status": "done",
-    "title": "Benchmark report: baseline vs advanced（最適化/同化/縮退）比較レポート生成",
-    "path": "work/tasks/T052_benchmark_report.md",
-    "skills": [
-      "python",
-      "reporting"
-    ],
-    "contracts": [
-      "docs/06_TESTING_AND_QA.md"
-    ],
-    "depends_on": [
-      "T041",
-      "T044",
-      "T048",
-      "T039",
-      "T040",
-      "T051",
-      "T040G"
-    ]
-  },
-  {
-    "id": "T052G",
-    "priority": 2,
-    "status": "done",
-    "title": "Phase Gate P2→P3: Optimization/Assimilation/Reduction/Golden/Benchmark の統合テスト・修正/軽リファクタ",
-    "path": "work/tasks/T052G_phase_gate_p2.md",
-    "skills": [
-      "python",
-      "qa",
-      "integration"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md",
-      "docs/02_ARTIFACT_CONTRACTS.md",
-      "docs/06_TESTING_AND_QA.md"
-    ],
-    "depends_on": [
-      "T041",
-      "T042",
-      "T043",
-      "T044",
-      "T045",
-      "T046",
-      "T047",
-      "T048",
-      "T049",
-      "T050",
-      "T051",
-      "T052",
-      "T040G"
-    ],
-    "unblocks": [
-      "T053",
-      "T054",
-      "T055",
-      "T056",
-      "T057",
-      "T058",
-      "T059",
-      "T060"
-    ]
-  },
-  {
-    "id": "T053",
-    "priority": 3,
-    "status": "done",
-    "title": "Graph Laplacian: L/D/正規化ラプラシアン計算 + 保存（GraphArtifact拡張or別Artifact）",
-    "path": "work/tasks/T053_graph_laplacian.md",
-    "skills": [
-      "python",
-      "graph",
-      "linear-algebra"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md"
-    ],
-    "depends_on": [
-      "T033",
-      "T052G"
-    ]
-  },
-  {
-    "id": "T054",
-    "priority": 3,
-    "status": "done",
-    "title": "Assimilation: Laplacian regularizer（ペナルティ/疑似観測）をEKIに統合（オプション）",
-    "path": "work/tasks/T054_assim_laplacian_regularized.md",
-    "skills": [
-      "python",
-      "data-assimilation"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md"
-    ],
-    "depends_on": [
-      "T053",
-      "T044",
-      "T052G"
-    ]
-  },
-  {
-    "id": "T055",
-    "priority": 3,
-    "status": "done",
-    "title": "MBDoE/FIM skeleton: 感度から条件候補をランキング（D-opt等は将来）",
-    "path": "work/tasks/T055_mbdoe_fim_ranking.md",
-    "skills": [
-      "python",
-      "design-of-experiments"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md"
-    ],
-    "depends_on": [
-      "T037",
-      "T025",
-      "T052G"
-    ]
-  },
-  {
-    "id": "T056",
-    "priority": 3,
-    "status": "done",
-    "title": "Active Subspace skeleton: 感度/サンプルから低次元方向を推定（簡易）",
-    "path": "work/tasks/T056_active_subspace_skeleton.md",
-    "skills": [
-      "python",
-      "dimension-reduction"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md"
-    ],
-    "depends_on": [
-      "T055",
-      "T052G"
-    ]
-  },
-  {
-    "id": "T057",
-    "priority": 3,
-    "status": "done",
-    "title": "SBI interface skeleton: sbiがあれば事後推定、無ければskip（summary=features）",
-    "path": "work/tasks/T057_sbi_interface_skeleton.md",
-    "skills": [
-      "python",
-      "bayesian-inference"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md"
-    ],
-    "depends_on": [
-      "T034",
-      "T025",
-      "T052G"
-    ]
-  },
-  {
-    "id": "T058",
-    "priority": 3,
-    "status": "done",
-    "title": "GNN dataset export: 動的グラフ/イベント列をArtifactとして出力（自己教師前処理）",
-    "path": "work/tasks/T058_gnn_dataset_export.md",
-    "skills": [
-      "python",
-      "graph-ml"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md"
-    ],
-    "depends_on": [
-      "T033",
-      "T022",
-      "T052G"
-    ]
-  },
-  {
-    "id": "T059",
-    "priority": 3,
-    "status": "done",
-    "title": "Multi-fidelity optimization skeleton: 縮退機構を低忠実度として探索に利用",
-    "path": "work/tasks/T059_multi_fidelity_opt_skeleton.md",
-    "skills": [
-      "python",
-      "optimization"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md"
-    ],
-    "depends_on": [
-      "T041",
-      "T046",
-      "T048",
-      "T052G"
-    ]
-  },
-  {
-    "id": "T060",
-    "priority": 3,
-    "status": "done",
-    "title": "CI/Docs polish: 最小CI・README・開発者向けクイックスタート整備",
-    "path": "work/tasks/T060_ci_docs_polish.md",
-    "skills": [
-      "ci",
-      "docs"
-    ],
-    "contracts": [
-      "docs/07_CONTRIBUTING.md"
-    ],
-    "depends_on": [
-      "T017",
-      "T051",
-      "T019",
-      "T015",
-      "T052G"
-    ]
-  },
-  {
-    "id": "T060G",
-    "priority": 3,
-    "status": "done",
-    "title": "Phase Gate P3→Release: Advanced（Laplacian/MBDoE/AS/SBI/GNN/MF）を含む全体回帰・修正/整理",
-    "path": "work/tasks/T060G_phase_gate_p3.md",
-    "skills": [
-      "python",
-      "qa",
-      "release"
-    ],
-    "contracts": [
-      "docs/00_INVARIANTS.md",
-      "docs/06_TESTING_AND_QA.md",
-      "docs/07_CONTRIBUTING.md"
-    ],
-    "depends_on": [
-      "T053",
-      "T054",
-      "T055",
-      "T056",
-      "T057",
-      "T058",
-      "T059",
-      "T060",
-      "T052G"
-    ]
-  }
-]
+{
+  "tasks": [
+    {
+      "id": "T060G",
+      "priority": "P0",
+      "status": "done",
+      "title": "設定/出力の簡素化 v2：yaml爆発と出力階層を解消し RunStore を唯一の真実にする",
+      "path": "work/tasks/T060G_config_output_simplify_v2.md",
+      "skills": [
+        "architecture",
+        "refactor",
+        "hydra",
+        "dx"
+      ],
+      "contracts": [
+        "docs/00_INVARIANTS.md",
+        "docs/04_CONFIG_SIMPLIFICATION.md",
+        "docs/05_ARTIFACT_CONTRACTS.md"
+      ]
+    },
+    {
+      "id": "T061G",
+      "priority": "P0",
+      "status": "done",
+      "title": "Artifact契約の強制と移行：RunStore manifest/metrics/config の必須化＋legacy互換読み込み",
+      "path": "work/tasks/T061G_artifacts_contract_enforcement.md",
+      "skills": [
+        "architecture",
+        "refactor",
+        "data"
+      ],
+      "contracts": [
+        "docs/00_INVARIANTS.md",
+        "docs/05_ARTIFACT_CONTRACTS.md"
+      ],
+      "depends_on": [
+        "T060G"
+      ]
+    },
+    {
+      "id": "T062G",
+      "priority": "P0",
+      "status": "done",
+      "title": "TemporalFluxGraph v2：時間窓・条件統合・疎行列保存を共通部品として確立（CNR/GNN/AMORE共通）",
+      "path": "work/tasks/T062G_temporal_flux_graph_v2.md",
+      "skills": [
+        "graph",
+        "data",
+        "performance"
+      ],
+      "contracts": [
+        "docs/03_TEMPORAL_NETWORK_SPEC.md",
+        "docs/05_ARTIFACT_CONTRACTS.md"
+      ],
+      "depends_on": [
+        "T061G"
+      ]
+    },
+    {
+      "id": "T063G",
+      "priority": "P1",
+      "status": "done",
+      "title": "CNR-Coarse拡張：動的ネットワーク（時間窓）×制約付きクラスタで mapping 作成＋superstate特徴量出力",
+      "path": "work/tasks/T063G_cnr_coarse_temporal_mapping.md",
+      "skills": [
+        "graph",
+        "reduction",
+        "viz"
+      ],
+      "contracts": [
+        "docs/02_REDUCTION_METHODS.md",
+        "docs/03_TEMPORAL_NETWORK_SPEC.md",
+        "docs/05_ARTIFACT_CONTRACTS.md"
+      ],
+      "depends_on": [
+        "T062G"
+      ]
+    },
+    {
+      "id": "T064G",
+      "priority": "P1",
+      "status": "done",
+      "title": "AMORE-Search拡張：MechanismCompiler共通化＋キャッシュ＋cheap dynamic score で探索を現実速度へ",
+      "path": "work/tasks/T064G_amore_search_cache_cheapscore.md",
+      "skills": [
+        "search",
+        "performance",
+        "mechanism"
+      ],
+      "contracts": [
+        "docs/02_REDUCTION_METHODS.md",
+        "docs/05_ARTIFACT_CONTRACTS.md"
+      ],
+      "depends_on": [
+        "T062G"
+      ]
+    },
+    {
+      "id": "T065G",
+      "priority": "P1",
+      "status": "done",
+      "title": "LearnCK-Styleスキャフォールド：stable states spec＋射影データセット＋overall reaction テンプレ＋検証ループ",
+      "path": "work/tasks/T065G_learnck_style_scaffold.md",
+      "skills": [
+        "ml",
+        "microkinetics",
+        "data"
+      ],
+      "contracts": [
+        "docs/02_REDUCTION_METHODS.md",
+        "docs/05_ARTIFACT_CONTRACTS.md"
+      ],
+      "depends_on": [
+        "T061G"
+      ]
+    },
+    {
+      "id": "T066G",
+      "priority": "P1",
+      "status": "done",
+      "title": "GNNデータ基盤：TemporalFluxGraph→PyG dataset 変換＋optional extras（gnn）＋遅延import対応",
+      "path": "work/tasks/T066G_gnn_dataset_builder.md",
+      "skills": [
+        "ml",
+        "data",
+        "packaging"
+      ],
+      "contracts": [
+        "docs/03_TEMPORAL_NETWORK_SPEC.md",
+        "docs/05_ARTIFACT_CONTRACTS.md"
+      ],
+      "depends_on": [
+        "T062G",
+        "T060G"
+      ]
+    },
+    {
+      "id": "T067G",
+      "priority": "P2",
+      "status": "done",
+      "title": "GNN-A：動的GNN（TGAT/TGN相当）＋DiffPoolで学習可能な状態マージ（mapping）を生成",
+      "path": "work/tasks/T067G_gnn_pool_temporal_diffpool.md",
+      "skills": [
+        "gnn",
+        "ml",
+        "graph"
+      ],
+      "contracts": [
+        "docs/02_REDUCTION_METHODS.md",
+        "docs/03_TEMPORAL_NETWORK_SPEC.md",
+        "docs/05_ARTIFACT_CONTRACTS.md"
+      ],
+      "depends_on": [
+        "T066G",
+        "T061G"
+      ]
+    },
+    {
+      "id": "T068G",
+      "priority": "P2",
+      "status": "done",
+      "title": "GNN-A評価：mapping品質指標（flux coverage / QoI近傍保持 / 安定性）＋CNRとの比較レポート自動生成",
+      "path": "work/tasks/T068G_gnn_pool_evaluation.md",
+      "skills": [
+        "ml",
+        "metrics",
+        "viz"
+      ],
+      "contracts": [
+        "docs/05_ARTIFACT_CONTRACTS.md"
+      ],
+      "depends_on": [
+        "T067G",
+        "T063G"
+      ]
+    },
+    {
+      "id": "T069G",
+      "priority": "P2",
+      "status": "done",
+      "title": "GNN-B：動的GNNで反応/種重要度を推定→QoI条件付きPruningで縮約メカを合成（閾値探索付き）",
+      "path": "work/tasks/T069G_gnn_importance_prune.md",
+      "skills": [
+        "gnn",
+        "ml",
+        "mechanism"
+      ],
+      "contracts": [
+        "docs/02_REDUCTION_METHODS.md",
+        "docs/05_ARTIFACT_CONTRACTS.md"
+      ],
+      "depends_on": [
+        "T066G",
+        "T061G"
+      ]
+    },
+    {
+      "id": "T070G",
+      "priority": "P2",
+      "status": "done",
+      "title": "GNN-C：候補評価サロゲートでAMORE探索を加速（active learning＋不確実性ゲート）",
+      "path": "work/tasks/T070G_gnn_surrogate_for_amore.md",
+      "skills": [
+        "ml",
+        "active_learning",
+        "search"
+      ],
+      "contracts": [
+        "docs/05_ARTIFACT_CONTRACTS.md"
+      ],
+      "depends_on": [
+        "T064G",
+        "T066G"
+      ]
+    },
+    {
+      "id": "T071G",
+      "priority": "P2",
+      "status": "done",
+      "title": "統合比較ハーネス：同一ベンチ（GRI30 325等）で CNR/AMORE/LearnCK/GNN を回しレポート生成",
+      "path": "work/tasks/T071G_method_comparison_harness.md",
+      "skills": [
+        "benchmark",
+        "viz",
+        "dx"
+      ],
+      "contracts": [
+        "docs/05_ARTIFACT_CONTRACTS.md"
+      ],
+      "depends_on": [
+        "T063G",
+        "T064G",
+        "T065G",
+        "T068G",
+        "T069G"
+      ]
+    },
+    {
+      "id": "T072G",
+      "priority": "P3",
+      "status": "done",
+      "title": "P0〜P2の回帰テスト拡充：各recipeのsmoke/integration test＋再現性（seed）＋失敗診断",
+      "path": "work/tasks/T072G_regression_tests_p0_p2.md",
+      "skills": [
+        "testing",
+        "ci",
+        "dx"
+      ],
+      "contracts": [
+        "docs/00_INVARIANTS.md",
+        "docs/06_REFACTORING_POLICY.md"
+      ],
+      "depends_on": [
+        "T071G"
+      ]
+    },
+    {
+      "id": "T073G",
+      "priority": "P3",
+      "status": "done",
+      "title": "開発者体験の改善：ドキュメント整備（Quickstart/How-to add reducer）＋lint/format/type導入",
+      "path": "work/tasks/T073G_devex_docs_tooling.md",
+      "skills": [
+        "docs",
+        "dx",
+        "refactor"
+      ],
+      "contracts": [
+        "docs/06_REFACTORING_POLICY.md"
+      ],
+      "depends_on": [
+        "T060G",
+        "T072G"
+      ]
+    },
+    {
+      "id": "T074G",
+      "priority": "P3",
+      "status": "done",
+      "title": "ClearML 連携の下地（実装は軽量）：RunStore→ClearML task 変換アダプタ（optional dependency）",
+      "path": "work/tasks/T074G_clearml_scaffold.md",
+      "skills": [
+        "integration",
+        "dx"
+      ],
+      "contracts": [
+        "docs/07_CLEARML_FUTURE.md",
+        "docs/05_ARTIFACT_CONTRACTS.md"
+      ],
+      "depends_on": [
+        "T061G"
+      ]
+    },
+    {
+      "id": "T075G",
+      "priority": "P3",
+      "status": "done",
+      "title": "データセット管理の下地：条件テーブル＋時系列データのdataset manifest/registry（将来拡張用）",
+      "path": "work/tasks/T075G_dataset_registry_scaffold.md",
+      "skills": [
+        "data",
+        "dx"
+      ],
+      "contracts": [
+        "docs/05_ARTIFACT_CONTRACTS.md",
+        "docs/07_CLEARML_FUTURE.md"
+      ],
+      "depends_on": [
+        "T061G"
+      ]
+    },
+    {
+      "id": "T080R",
+      "priority": "P0",
+      "status": "done",
+      "title": "RunStore出力レイアウトの一本化（timeseries/graphs/vizの標準化）",
+      "path": "work/tasks/T080R_runstore_layout_unify.md",
+      "skills": [
+        "architecture",
+        "data",
+        "io"
+      ],
+      "contracts": [
+        "docs/00_INVARIANTS.md",
+        "docs/02_ARTIFACT_CONTRACTS.md",
+        "docs/03_CONFIG_CONVENTIONS.md"
+      ],
+      "depends_on": [
+        "T061G"
+      ]
+    },
+    {
+      "id": "T081R",
+      "priority": "P0",
+      "status": "done",
+      "title": "Structured Config化とyaml最小化（default + recipes）",
+      "path": "work/tasks/T081R_structured_config_minimize.md",
+      "skills": [
+        "hydra",
+        "refactor",
+        "dx"
+      ],
+      "contracts": [
+        "docs/00_INVARIANTS.md",
+        "docs/03_CONFIG_CONVENTIONS.md",
+        "docs/04_CONFIG_SIMPLIFICATION.md"
+      ],
+      "depends_on": [
+        "T080R"
+      ]
+    },
+    {
+      "id": "T082R",
+      "priority": "P0",
+      "status": "done",
+      "title": "CLIのrun体験統一（recipe + run_id）",
+      "path": "work/tasks/T082R_cli_run_recipe_simplify.md",
+      "skills": [
+        "cli",
+        "dx",
+        "refactor"
+      ],
+      "contracts": [
+        "docs/00_INVARIANTS.md",
+        "docs/03_CONFIG_CONVENTIONS.md"
+      ],
+      "depends_on": [
+        "T081R"
+      ]
+    },
+    {
+      "id": "T083R",
+      "priority": "P1",
+      "status": "done",
+      "title": "Methods/Viz/QoIのプラグイン化（if/else増殖抑止）",
+      "path": "work/tasks/T083R_plugin_registry_refactor.md",
+      "skills": [
+        "architecture",
+        "refactor"
+      ],
+      "contracts": [
+        "docs/00_INVARIANTS.md",
+        "docs/02_ARTIFACT_CONTRACTS.md"
+      ],
+      "depends_on": [
+        "T081R"
+      ]
+    },
+    {
+      "id": "T084R",
+      "priority": "P1",
+      "status": "done",
+      "title": "TemporalFluxGraph共通化（graphs/temporal_flux_graph.py）",
+      "path": "work/tasks/T084R_temporal_graph_core_unify.md",
+      "skills": [
+        "graph",
+        "refactor"
+      ],
+      "contracts": [
+        "docs/00_INVARIANTS.md",
+        "docs/02_ARTIFACT_CONTRACTS.md",
+        "docs/03_TEMPORAL_NETWORK_SPEC.md"
+      ],
+      "depends_on": [
+        "T080R"
+      ]
+    },
+    {
+      "id": "T085R",
+      "priority": "P1",
+      "status": "done",
+      "title": "可視化刷新（ネットワーク系）",
+      "path": "work/tasks/T085R_viz_network_plots.md",
+      "skills": [
+        "viz",
+        "graph"
+      ],
+      "contracts": [
+        "docs/00_INVARIANTS.md",
+        "docs/05_VISUALIZATION_STANDARDS.md"
+      ],
+      "depends_on": [
+        "T084R"
+      ]
+    },
+    {
+      "id": "T086R",
+      "priority": "P1",
+      "status": "done",
+      "title": "可視化刷新（時系列/QoI/縮退比較）",
+      "path": "work/tasks/T086R_viz_timeseries_qoi.md",
+      "skills": [
+        "viz",
+        "analysis"
+      ],
+      "contracts": [
+        "docs/00_INVARIANTS.md",
+        "docs/05_VISUALIZATION_STANDARDS.md"
+      ],
+      "depends_on": [
+        "T080R"
+      ]
+    },
+    {
+      "id": "T087R",
+      "priority": "P1",
+      "status": "done",
+      "title": "Reduction手法のプラグイン統合（CNR/AMORE/LearnCK/GNN）",
+      "path": "work/tasks/T087R_reduction_plugins_consolidate.md",
+      "skills": [
+        "reduction",
+        "architecture"
+      ],
+      "contracts": [
+        "docs/00_INVARIANTS.md",
+        "docs/02_ARTIFACT_CONTRACTS.md",
+        "docs/02_REDUCTION_METHODS.md"
+      ],
+      "depends_on": [
+        "T083R"
+      ]
+    },
+    {
+      "id": "T088R",
+      "priority": "P1",
+      "status": "done",
+      "title": "条件テーブル（cases）管理の整理",
+      "path": "work/tasks/T088R_conditions_table_registry.md",
+      "skills": [
+        "data",
+        "dx"
+      ],
+      "contracts": [
+        "docs/00_INVARIANTS.md",
+        "docs/02_ARTIFACT_CONTRACTS.md"
+      ],
+      "depends_on": [
+        "T080R"
+      ]
+    },
+    {
+      "id": "T089R",
+      "priority": "P2",
+      "status": "done",
+      "title": "Contract/Smoke/Regressionテストの再整備",
+      "path": "work/tasks/T089R_tests_contracts_smoke.md",
+      "skills": [
+        "testing",
+        "ci"
+      ],
+      "contracts": [
+        "docs/00_INVARIANTS.md",
+        "docs/06_TESTING_AND_QA.md"
+      ],
+      "depends_on": [
+        "T086R"
+      ]
+    },
+    {
+      "id": "T090R",
+      "priority": "P2",
+      "status": "done",
+      "title": "Docs更新（設計契約/運用/拡張ガイド）",
+      "path": "work/tasks/T090R_docs_update.md",
+      "skills": [
+        "docs",
+        "dx"
+      ],
+      "contracts": [
+        "docs/00_INVARIANTS.md",
+        "docs/02_ARTIFACT_CONTRACTS.md",
+        "docs/03_CONFIG_CONVENTIONS.md"
+      ],
+      "depends_on": [
+        "T082R"
+      ]
+    },
+    {
+      "id": "T091R",
+      "priority": "P2",
+      "status": "done",
+      "title": "Legacy yamlの整理と移行ガイド",
+      "path": "work/tasks/T091R_cleanup_legacy_yaml.md",
+      "skills": [
+        "docs",
+        "refactor"
+      ],
+      "contracts": [
+        "docs/00_INVARIANTS.md",
+        "docs/03_CONFIG_CONVENTIONS.md",
+        "docs/04_CONFIG_SIMPLIFICATION.md"
+      ],
+      "depends_on": [
+        "T081R"
+      ]
+    }
+  ]
+}

@@ -39,6 +39,7 @@ $ python tools/codex_loop/run_loop.py --list
 - 原則 `--full-auto` を使う（承認待ちを最小化）
 - ネットワークやリポジトリ外操作は止まりやすいので、タスクで避ける
 - 出力は `tools/codex_loop/response_schema.json` に合わせてJSONのみ
+- 同時実行は避ける（`work/.codex_loop.lock` で排他制御）
 
 ## 危険オプション
 - `--yolo` は承認・sandboxをバイパスする可能性があります。

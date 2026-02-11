@@ -1,0 +1,49 @@
+name: reduce_learnck_style
+steps:
+  - id: sim
+    task: sim.run
+    sim: ${sim}
+  - id: stable_projection
+    task: features.stable_projection
+    inputs:
+      run_id: "@sim"
+    params:
+      stable_states: reduction/learnck/stable_states.yaml
+      x_var: X
+      coverage_var: coverage
+      stats: [last]
+  - id: learnck
+    task: reduction.dispatch
+    inputs:
+      run_id: "@sim"
+      stable_features_id: "@stable_projection"
+      mechanism: ${sim.mechanism}
+    method: learnck_style
+    params:
+      stable_states: reduction/learnck/stable_states.yaml
+  - id: validate
+    task: reduction.validate
+    inputs:
+      mechanism: ${sim.mechanism}
+      patches: "@learnck"
+    params:
+      validation:
+        pipeline:
+          steps:
+            - id: sim
+              task: sim.run
+              sim: ${sim}
+            - id: obs
+              task: observables.run
+              inputs:
+                run_id: "@sim"
+              params:
+                observables:
+                  - name: gas_composition
+                    params:
+                      stats: [last]
+                      top_n: 2
+                missing_strategy: skip
+        metric: abs
+        tolerance: 1.0e-6
+        missing_strategy: skip

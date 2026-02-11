@@ -1,0 +1,211 @@
+# Minimal multicase evaluation: build multicase importance (ROP/GNN), prune sweep,
+# validate across all cases, and pick the most-reduced passing patch per method.
+steps:
+  - id: sim_train
+    task: sim.sweep_csv
+    sim: ${sim}
+    params:
+      conditions_file: ${benchmarks.conditions_file}
+      case_mode: all
+      # temporal_flux currently requires identical time grid across runs.
+      time_grid_policy: max
+
+  - id: graph_mech
+    task: graphs.stoich
+    graphs:
+      mechanism: ${mechanism.path}
+    params: {}
+
+  - id: graph_flux_train
+    task: graphs.temporal_flux
+    inputs:
+      run_set_id: "@sim_train"
+      mechanism: ${mechanism.path}
+    params: {}
+
+  - id: features_rop_train
+    task: features.run
+    inputs: { run_set_id: "@sim_train" }
+    params:
+      cache_bust: "2026-02-11"
+      features:
+        - name: rop_wdot_summary
+          params:
+            rop:
+              stats: [integral]
+              top_n: 400
+          rank_by: integral
+          rank_abs: true
+
+  - id: gnn_dataset_train
+    task: gnn_dataset.temporal_graph_pyg
+    inputs:
+      run_set_id: "@sim_train"
+      graph_id: "@graph_flux_train"
+    params:
+      node_features: [X]
+      split:
+        train_ratio: 0.8
+        val_ratio: 0.2
+
+  - id: features_gnn_train
+    task: features.gnn_importance
+    inputs:
+      run_set_id: "@sim_train"
+      graph_id: "@graph_flux_train"
+      dataset_id: "@gnn_dataset_train"
+    params:
+      rop_var: rop_net
+      rop_use_abs: true
+      gnn:
+        alpha: 0.6
+        steps: 1
+        feature_norm: mean_abs
+      output:
+        reaction_feature: gnn_reaction_importance
+        species_feature: gnn_species_importance
+        include_reactions: true
+        include_species: false
+
+  # ROP sweep (multicase importance): keep top_k reactions; disable the rest.
+  - id: red_rop_k120
+    task: reduction.threshold_prune
+    inputs: { features: "@features_rop_train", graph_id: "@graph_mech" }
+    importance: { column: value, mode: abs, aggregate: max }
+    threshold: { top_k: 120 }
+  - id: red_rop_k100
+    task: reduction.threshold_prune
+    inputs: { features: "@features_rop_train", graph_id: "@graph_mech" }
+    importance: { column: value, mode: abs, aggregate: max }
+    threshold: { top_k: 100 }
+  - id: red_rop_k80
+    task: reduction.threshold_prune
+    inputs: { features: "@features_rop_train", graph_id: "@graph_mech" }
+    importance: { column: value, mode: abs, aggregate: max }
+    threshold: { top_k: 80 }
+  - id: red_rop_k60
+    task: reduction.threshold_prune
+    inputs: { features: "@features_rop_train", graph_id: "@graph_mech" }
+    importance: { column: value, mode: abs, aggregate: max }
+    threshold: { top_k: 60 }
+  - id: red_rop_k50
+    task: reduction.threshold_prune
+    inputs: { features: "@features_rop_train", graph_id: "@graph_mech" }
+    importance: { column: value, mode: abs, aggregate: max }
+    threshold: { top_k: 50 }
+
+  - id: val_rop
+    task: reduction.validate
+    inputs:
+      patches: ["@red_rop_k120", "@red_rop_k100", "@red_rop_k80", "@red_rop_k60", "@red_rop_k50"]
+    mechanism: ${mechanism.path}
+    validation:
+      label: rop_multicase
+      pipeline: ${oc.select:benchmarks.validation_pipeline,bench_gri30_netbench_validation}
+      case_mode: all
+      conditions_file: ${benchmarks.conditions_file}
+      metric: rel
+      tolerance: 0.5
+      stop_on_fail: false
+      use_multipliers_only: true
+      sim_step_id: sim
+      observables_step_id: observables
+      features_step_id: features
+
+  - id: repair_rop
+    task: reduction.repair_topk
+    inputs:
+      validation_id: "@val_rop"
+    policy:
+      target_pass_rate: 1.0
+      objective: disabled_reactions
+
+  - id: val_rop_selected
+    task: reduction.validate
+    inputs:
+      patches: ["@repair_rop"]
+    mechanism: ${mechanism.path}
+    validation:
+      label: rop_multicase_selected
+      pipeline: ${oc.select:benchmarks.validation_pipeline,bench_gri30_netbench_validation}
+      case_mode: all
+      conditions_file: ${benchmarks.conditions_file}
+      metric: rel
+      tolerance: 0.5
+      stop_on_fail: false
+      use_multipliers_only: true
+      sim_step_id: sim
+      observables_step_id: observables
+      features_step_id: features
+
+  # GNN sweep (multicase importance).
+  - id: red_gnn_k120
+    task: reduction.threshold_prune
+    inputs: { features: "@features_gnn_train", graph_id: "@graph_mech" }
+    importance: { column: value, mode: abs, aggregate: max }
+    threshold: { top_k: 120 }
+  - id: red_gnn_k100
+    task: reduction.threshold_prune
+    inputs: { features: "@features_gnn_train", graph_id: "@graph_mech" }
+    importance: { column: value, mode: abs, aggregate: max }
+    threshold: { top_k: 100 }
+  - id: red_gnn_k80
+    task: reduction.threshold_prune
+    inputs: { features: "@features_gnn_train", graph_id: "@graph_mech" }
+    importance: { column: value, mode: abs, aggregate: max }
+    threshold: { top_k: 80 }
+  - id: red_gnn_k60
+    task: reduction.threshold_prune
+    inputs: { features: "@features_gnn_train", graph_id: "@graph_mech" }
+    importance: { column: value, mode: abs, aggregate: max }
+    threshold: { top_k: 60 }
+  - id: red_gnn_k50
+    task: reduction.threshold_prune
+    inputs: { features: "@features_gnn_train", graph_id: "@graph_mech" }
+    importance: { column: value, mode: abs, aggregate: max }
+    threshold: { top_k: 50 }
+
+  - id: val_gnn
+    task: reduction.validate
+    inputs:
+      patches: ["@red_gnn_k120", "@red_gnn_k100", "@red_gnn_k80", "@red_gnn_k60", "@red_gnn_k50"]
+    mechanism: ${mechanism.path}
+    validation:
+      label: gnn_multicase
+      pipeline: ${oc.select:benchmarks.validation_pipeline,bench_gri30_netbench_validation}
+      case_mode: all
+      conditions_file: ${benchmarks.conditions_file}
+      metric: rel
+      tolerance: 0.5
+      stop_on_fail: false
+      use_multipliers_only: true
+      sim_step_id: sim
+      observables_step_id: observables
+      features_step_id: features
+
+  - id: repair_gnn
+    task: reduction.repair_topk
+    inputs:
+      validation_id: "@val_gnn"
+    policy:
+      target_pass_rate: 1.0
+      objective: disabled_reactions
+
+  - id: val_gnn_selected
+    task: reduction.validate
+    inputs:
+      patches: ["@repair_gnn"]
+    mechanism: ${mechanism.path}
+    validation:
+      label: gnn_multicase_selected
+      pipeline: ${oc.select:benchmarks.validation_pipeline,bench_gri30_netbench_validation}
+      case_mode: all
+      conditions_file: ${benchmarks.conditions_file}
+      metric: rel
+      tolerance: 0.5
+      stop_on_fail: false
+      use_multipliers_only: true
+      sim_step_id: sim
+      observables_step_id: observables
+      features_step_id: features
+

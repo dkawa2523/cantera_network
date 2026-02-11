@@ -78,8 +78,12 @@
   - ダッシュボード種別（ds/chem）
   - 図の生成設定（Top-N, 閾値, 時間窓など）
 
+### 3.1 静的画像の命名規約
+- `viz/` 配下に用途別ディレクトリのみ作成する（network / timeseries / reduction）
+- ファイル名は `"<plot>__<run_id>__<tag>.<ext>"` を標準とする
+  - 例: `species__demo01__X.svg`, `rates__demo01__net_production_rates.svg`
+
 ## 4. 実装ガイド（最小依存）
 - P0は `plotly` を基本（HTMLに埋め込みやすい）
 - 高負荷を避けるため、データは事前に features/sensitivity で集約しておく
 - “巨大な時系列をそのまま描く” を避け、Top-N + downsample を基本とする
-

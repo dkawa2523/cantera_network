@@ -4,44 +4,50 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
 import copy
-import json
 import logging
 import math
-import platform
 from pathlib import Path
-import subprocess
 from typing import Any, Optional
-
-from rxn_platform import __version__
-from rxn_platform.core import ArtifactManifest, make_artifact_id, normalize_reaction_multipliers
+from rxn_platform.core import make_artifact_id, normalize_reaction_multipliers
 from rxn_platform.errors import ConfigError
-from rxn_platform.hydra_utils import resolve_config
+from rxn_platform.io_utils import write_json_atomic
 from rxn_platform.pipelines import PipelineRunner
 from rxn_platform.registry import Registry, register
 from rxn_platform.store import ArtifactCacheResult, ArtifactStore
-
-try:  # Optional dependency.
-    import pandas as pd
-except ImportError:  # pragma: no cover - optional dependency
-    pd = None
-
-try:  # Optional dependency.
-    import pyarrow.parquet as pq
-except ImportError:  # pragma: no cover - optional dependency
-    pq = None
+from rxn_platform.tasks.common import (
+    build_manifest,
+    code_metadata as _code_metadata,
+    read_table_rows as _read_table_rows,
+    resolve_cfg as _resolve_cfg,
+)
 
 try:  # Optional dependency.
     import torch
     from sbi import utils as sbi_utils
-    from sbi.inference import SNPE, prepare_for_sbi, simulate_for_sbi
+    from sbi.inference import SNPE, simulate_for_sbi
+    try:
+        from sbi.inference import prepare_for_sbi
+    except ImportError:  # pragma: no cover - optional dependency
+        prepare_for_sbi = None
 except ImportError:  # pragma: no cover - optional dependency
     torch = None
     sbi_utils = None
     SNPE = None
     prepare_for_sbi = None
     simulate_for_sbi = None
+
+if (
+    torch is not None
+    and sbi_utils is not None
+    and SNPE is not None
+    and simulate_for_sbi is not None
+    and prepare_for_sbi is None
+):
+    def prepare_for_sbi(  # type: ignore[no-redef]
+        simulator: Any, prior: Any
+    ) -> tuple[Any, Any]:
+        return simulator, prior
 
 DEFAULT_NUM_SIMULATIONS = 4
 DEFAULT_MAX_EPOCHS = 1
@@ -68,48 +74,6 @@ class ParameterSpec:
         else:
             payload["path"] = self.key
         return payload
-
-
-def _utc_now_iso() -> str:
-    timestamp = datetime.now(timezone.utc).replace(microsecond=0)
-    return timestamp.isoformat().replace("+00:00", "Z")
-
-
-def _code_metadata() -> dict[str, Any]:
-    payload: dict[str, Any] = {"version": __version__}
-    git_dir = Path.cwd() / ".git"
-    if not git_dir.exists():
-        return payload
-    try:
-        commit = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
-        payload["git_commit"] = commit
-        dirty = subprocess.check_output(
-            ["git", "status", "--porcelain"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
-        payload["dirty"] = bool(dirty)
-    except (OSError, subprocess.SubprocessError):
-        return payload
-    return payload
-
-
-def _provenance_metadata() -> dict[str, Any]:
-    return {"python": platform.python_version()}
-
-
-def _resolve_cfg(cfg: Any) -> dict[str, Any]:
-    try:
-        resolved = resolve_config(cfg)
-    except ConfigError:
-        if isinstance(cfg, Mapping):
-            return dict(cfg)
-        raise
-    return resolved
 
 
 def _extract_sbi_cfg(cfg: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -616,23 +580,6 @@ def _run_sim_and_features(
     return results["features"]
 
 
-def _read_table_rows(path: Path) -> list[dict[str, Any]]:
-    if pd is not None:
-        try:
-            frame = pd.read_parquet(path)
-            return frame.to_dict(orient="records")
-        except Exception:
-            pass
-    if pq is not None:
-        try:
-            table = pq.read_table(path)
-            return table.to_pylist()
-        except Exception:
-            pass
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    return list(payload.get("rows", []))
-
-
 def _load_feature_rows(store: ArtifactStore, features_id: str) -> list[dict[str, Any]]:
     store.read_manifest("features", features_id)
     table_path = store.artifact_dir("features", features_id) / "features.parquet"
@@ -693,11 +640,36 @@ def _dedupe_preserve(items: Sequence[str]) -> list[str]:
     return result
 
 
+def _stabilize_simulation_outputs(values: "torch.Tensor") -> "torch.Tensor":
+    if torch is None:
+        return values
+    if not torch.is_tensor(values):
+        return values
+    if values.numel() == 0:
+        return values
+    squeeze = False
+    x = values
+    if x.dim() == 1:
+        x = x.unsqueeze(0)
+        squeeze = True
+    x = torch.where(torch.isfinite(x), x, torch.zeros_like(x))
+    std = torch.std(x, dim=0)
+    if not torch.isfinite(std).all() or (std <= 0).any():
+        scale = 1.0e-3
+        if x.is_floating_point():
+            magnitude = float(torch.mean(torch.abs(x)).item())
+            scale = max(scale, magnitude * 1.0e-6)
+        x = x + torch.randn_like(x) * scale
+        std = torch.std(x, dim=0)
+        if not torch.isfinite(std).all() or (std <= 0).any():
+            x = x + torch.randn_like(x) * max(scale * 10.0, 1.0e-2)
+    if squeeze:
+        return x[0]
+    return x
+
+
 def _write_result(path: Path, payload: Mapping[str, Any]) -> None:
-    path.write_text(
-        json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    write_json_atomic(path, payload)
 
 
 def run(
@@ -725,16 +697,11 @@ def run(
             code=_code_metadata(),
             exclude_keys=("hydra",),
         )
-        manifest = ArtifactManifest(
-            schema_version=1,
+        manifest = build_manifest(
             kind="sbi",
-            id=artifact_id,
-            created_at=_utc_now_iso(),
-            parents=[],
+            artifact_id=artifact_id,
             inputs=inputs_payload,
             config=manifest_cfg,
-            code=_code_metadata(),
-            provenance=_provenance_metadata(),
             notes="skipped: sbi not installed",
         )
 
@@ -805,12 +772,22 @@ def run(
 
     simulator, prior = prepare_for_sbi(_simulator, prior)
     theta, x = simulate_for_sbi(simulator, proposal=prior, num_simulations=num_simulations)
+    theta = _stabilize_simulation_outputs(theta)
+    x = _stabilize_simulation_outputs(x)
 
-    inference = SNPE(prior=prior)
-    density_estimator = inference.append_simulations(theta, x).train(
-        max_num_epochs=max_epochs
-    )
-    posterior = inference.build_posterior(density_estimator)
+    posterior = None
+    training_error: Optional[str] = None
+    try:
+        inference = SNPE(prior=prior)
+        density_estimator = inference.append_simulations(theta, x).train(
+            max_num_epochs=max_epochs
+        )
+        posterior = inference.build_posterior(density_estimator)
+    except Exception as exc:
+        training_error = str(exc)
+        logger.warning(
+            "SNPE training failed; falling back to prior samples: %s", exc
+        )
 
     theta_list = theta.detach().cpu().tolist()
     x_list = x.detach().cpu().tolist()
@@ -837,9 +814,13 @@ def run(
     if posterior_samples > 0 and observed_values is not None:
         if len(observed_values) != len(summary_state.get("feature_names") or []):
             raise ConfigError("observed feature length does not match summary dimension.")
-        observed_tensor = torch.tensor(observed_values, dtype=torch.float32)
-        samples = posterior.sample((posterior_samples,), x=observed_tensor)
-        posterior_samples_list = samples.detach().cpu().tolist()
+        if posterior is None:
+            samples = prior.sample((posterior_samples,))
+            posterior_samples_list = samples.detach().cpu().tolist()
+        else:
+            observed_tensor = torch.tensor(observed_values, dtype=torch.float32)
+            samples = posterior.sample((posterior_samples,), x=observed_tensor)
+            posterior_samples_list = samples.detach().cpu().tolist()
 
     feature_names_final = summary_state.get("feature_names") or []
     inputs_payload: dict[str, Any] = {
@@ -865,16 +846,12 @@ def run(
     parents = _dedupe_preserve(feature_ids)
     if observed_kind == "features_id" and isinstance(observed_value, str):
         parents.append(observed_value)
-    manifest = ArtifactManifest(
-        schema_version=1,
+    manifest = build_manifest(
         kind="sbi",
-        id=artifact_id,
-        created_at=_utc_now_iso(),
+        artifact_id=artifact_id,
         parents=_dedupe_preserve(parents),
         inputs=inputs_payload,
         config=manifest_cfg,
-        code=_code_metadata(),
-        provenance=_provenance_metadata(),
     )
 
     result_payload: dict[str, Any] = {
@@ -893,6 +870,8 @@ def run(
         result_payload["observed"] = observed_values
     if posterior_samples_list is not None:
         result_payload["posterior_samples"] = posterior_samples_list
+    if training_error is not None:
+        result_payload["training_error"] = training_error
 
     def _writer(base_dir: Path) -> None:
         _write_result(base_dir / "sbi_result.json", result_payload)

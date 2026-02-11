@@ -1,0 +1,505 @@
+# NetBench: reduction method suite (multiple methods) + multi-case validation + viz
+steps:
+  - id: sim
+    task: sim.run_csv
+    sim: ${sim}
+    params:
+      conditions_file: ${benchmarks.conditions_file}
+      case_id: ${benchmarks.case_id}
+
+  - id: graph_mech
+    task: graphs.stoich
+    graphs:
+      mechanism: ${mechanism.path}
+    params: {}
+
+  - id: graph_flux
+    task: graphs.temporal_flux
+    inputs:
+      run_id: "@sim"
+      mechanism: ${mechanism.path}
+    params: {}
+
+  # State merge (species merge) based on stoichiometric graph similarity.
+  - id: node_lumping
+    task: reduction.node_lumping
+    inputs:
+      graph_id: "@graph_mech"
+    lumping:
+      method: threshold
+      threshold: 0.95
+      weights:
+        elements: 0.7
+        charge: 0.2
+        phase: 0.1
+        state: 0.0
+      charge_scale: 2.0
+      representative:
+        metric: degree
+
+  - id: red_state_merge
+    task: reduction.node_lumping_prune
+    inputs:
+      node_lumping: "@node_lumping"
+    mechanism: ${mechanism.path}
+    params:
+      protected_species: [CO, CO2]
+      require_same_composition: true
+      require_same_charge: true
+      cache_bust: node_lumping_prune_v2
+
+  - id: features_rop
+    task: features.run
+    inputs: { run_id: "@sim" }
+    params:
+      cache_bust: "2026-02-08"
+      features:
+        - name: rop_wdot_summary
+          params:
+            rop:
+              stats: [integral]
+              top_n: 400
+          rank_by: integral
+          rank_abs: true
+
+  - id: features_centrality
+    task: features.run
+    inputs: { run_id: "@sim", graph: "@graph_mech" }
+    params:
+      cache_bust: "2026-02-08"
+      features:
+        - name: network_metrics
+          params:
+            metrics: [betweenness]
+            node_kinds: [reaction]
+            top_n: 400
+            betweenness_max_nodes: 1500
+
+  - id: gnn_dataset
+    task: gnn_dataset.temporal_graph_pyg
+    inputs:
+      run_id: "@sim"
+      graph_id: "@graph_flux"
+    params:
+      node_features: [X]
+      split:
+        train_ratio: 0.8
+        val_ratio: 0.2
+
+  - id: features_gnn
+    task: features.gnn_importance
+    inputs:
+      run_ids: ["@sim"]
+      graph_id: "@graph_flux"
+      dataset_id: "@gnn_dataset"
+    params:
+      rop_var: rop_net
+      rop_use_abs: true
+      gnn:
+        alpha: 0.6
+        steps: 1
+        feature_norm: mean_abs
+      output:
+        reaction_feature: gnn_reaction_importance
+        species_feature: gnn_species_importance
+        include_reactions: true
+        include_species: false
+
+  # ROP sweep (keep top_k reactions by importance; disable the rest).
+  - id: red_rop_k250
+    task: reduction.threshold_prune
+    inputs: { features: "@features_rop", graph_id: "@graph_mech" }
+    importance: { column: value, mode: abs, aggregate: mean }
+    threshold: { top_k: 250 }
+  - id: red_rop_k200
+    task: reduction.threshold_prune
+    inputs: { features: "@features_rop", graph_id: "@graph_mech" }
+    importance: { column: value, mode: abs, aggregate: mean }
+    threshold: { top_k: 200 }
+  - id: red_rop_k150
+    task: reduction.threshold_prune
+    inputs: { features: "@features_rop", graph_id: "@graph_mech" }
+    importance: { column: value, mode: abs, aggregate: mean }
+    threshold: { top_k: 150 }
+  - id: red_rop_k120
+    task: reduction.threshold_prune
+    inputs: { features: "@features_rop", graph_id: "@graph_mech" }
+    importance: { column: value, mode: abs, aggregate: mean }
+    threshold: { top_k: 120 }
+  - id: red_rop_k100
+    task: reduction.threshold_prune
+    inputs: { features: "@features_rop", graph_id: "@graph_mech" }
+    importance: { column: value, mode: abs, aggregate: mean }
+    threshold: { top_k: 100 }
+  - id: red_rop_k80
+    task: reduction.threshold_prune
+    inputs: { features: "@features_rop", graph_id: "@graph_mech" }
+    importance: { column: value, mode: abs, aggregate: mean }
+    threshold: { top_k: 80 }
+  - id: red_rop_k60
+    task: reduction.threshold_prune
+    inputs: { features: "@features_rop", graph_id: "@graph_mech" }
+    importance: { column: value, mode: abs, aggregate: mean }
+    threshold: { top_k: 60 }
+  - id: red_rop_k50
+    task: reduction.threshold_prune
+    inputs: { features: "@features_rop", graph_id: "@graph_mech" }
+    importance: { column: value, mode: abs, aggregate: mean }
+    threshold: { top_k: 50 }
+
+  # Centrality sweep (keep top_k reactions by betweenness; disable the rest).
+  - id: red_cent_k250
+    task: reduction.threshold_prune
+    inputs: { features: "@features_centrality", graph_id: "@graph_mech" }
+    importance: { column: value, mode: abs, aggregate: max }
+    threshold: { top_k: 250 }
+  - id: red_cent_k200
+    task: reduction.threshold_prune
+    inputs: { features: "@features_centrality", graph_id: "@graph_mech" }
+    importance: { column: value, mode: abs, aggregate: max }
+    threshold: { top_k: 200 }
+  - id: red_cent_k150
+    task: reduction.threshold_prune
+    inputs: { features: "@features_centrality", graph_id: "@graph_mech" }
+    importance: { column: value, mode: abs, aggregate: max }
+    threshold: { top_k: 150 }
+  - id: red_cent_k120
+    task: reduction.threshold_prune
+    inputs: { features: "@features_centrality", graph_id: "@graph_mech" }
+    importance: { column: value, mode: abs, aggregate: max }
+    threshold: { top_k: 120 }
+  - id: red_cent_k100
+    task: reduction.threshold_prune
+    inputs: { features: "@features_centrality", graph_id: "@graph_mech" }
+    importance: { column: value, mode: abs, aggregate: max }
+    threshold: { top_k: 100 }
+  - id: red_cent_k80
+    task: reduction.threshold_prune
+    inputs: { features: "@features_centrality", graph_id: "@graph_mech" }
+    importance: { column: value, mode: abs, aggregate: max }
+    threshold: { top_k: 80 }
+  - id: red_cent_k60
+    task: reduction.threshold_prune
+    inputs: { features: "@features_centrality", graph_id: "@graph_mech" }
+    importance: { column: value, mode: abs, aggregate: max }
+    threshold: { top_k: 60 }
+  - id: red_cent_k50
+    task: reduction.threshold_prune
+    inputs: { features: "@features_centrality", graph_id: "@graph_mech" }
+    importance: { column: value, mode: abs, aggregate: max }
+    threshold: { top_k: 50 }
+
+  # GNN importance sweep (same threshold_prune but driven by features.gnn_importance reaction scores).
+  - id: red_gnn_k250
+    task: reduction.threshold_prune
+    inputs: { features: "@features_gnn", graph_id: "@graph_mech" }
+    importance: { column: value, mode: abs, aggregate: mean }
+    threshold: { top_k: 250 }
+  - id: red_gnn_k200
+    task: reduction.threshold_prune
+    inputs: { features: "@features_gnn", graph_id: "@graph_mech" }
+    importance: { column: value, mode: abs, aggregate: mean }
+    threshold: { top_k: 200 }
+  - id: red_gnn_k150
+    task: reduction.threshold_prune
+    inputs: { features: "@features_gnn", graph_id: "@graph_mech" }
+    importance: { column: value, mode: abs, aggregate: mean }
+    threshold: { top_k: 150 }
+  - id: red_gnn_k120
+    task: reduction.threshold_prune
+    inputs: { features: "@features_gnn", graph_id: "@graph_mech" }
+    importance: { column: value, mode: abs, aggregate: mean }
+    threshold: { top_k: 120 }
+  - id: red_gnn_k100
+    task: reduction.threshold_prune
+    inputs: { features: "@features_gnn", graph_id: "@graph_mech" }
+    importance: { column: value, mode: abs, aggregate: mean }
+    threshold: { top_k: 100 }
+  - id: red_gnn_k80
+    task: reduction.threshold_prune
+    inputs: { features: "@features_gnn", graph_id: "@graph_mech" }
+    importance: { column: value, mode: abs, aggregate: mean }
+    threshold: { top_k: 80 }
+  - id: red_gnn_k60
+    task: reduction.threshold_prune
+    inputs: { features: "@features_gnn", graph_id: "@graph_mech" }
+    importance: { column: value, mode: abs, aggregate: mean }
+    threshold: { top_k: 60 }
+  - id: red_gnn_k50
+    task: reduction.threshold_prune
+    inputs: { features: "@features_gnn", graph_id: "@graph_mech" }
+    importance: { column: value, mode: abs, aggregate: mean }
+    threshold: { top_k: 50 }
+
+  # AMORE beam search (single patch; internal validation uses the validation pipeline below).
+  - id: red_amore
+    task: reduction.dispatch
+    method: amore_search
+    inputs:
+      graph_id: "@graph_flux"
+      mechanism: ${mechanism.path}
+    params:
+      search:
+        beam_width: 2
+        max_depth: 80
+        expand_top: 2
+        cheap_score_min: 0.5
+        min_keep: 60
+      surrogate:
+        enabled: false
+      validation:
+        pipeline: bench_gri30_netbench_validation
+        metric: rel
+        tolerance: 0.5
+        missing_strategy: skip
+        sim_step_id: sim
+        observables_step_id: observables
+        features_step_id: features
+
+  # LearnCK-style scaffolding (effectively a no-op patch) + external validation.
+  - id: red_learnck
+    task: reduction.dispatch
+    method: learnck_style
+    mechanism: ${mechanism.path}
+    params:
+      stable_states: reduction/learnck/stable_states.yaml
+
+  # Reaction "merge" (cluster then keep representatives; disable the rest).
+  - id: reaction_lumping
+    task: reduction.reaction_lumping
+    inputs:
+      graph_id: "@graph_mech"
+    lumping:
+      method: threshold
+      threshold: 0.8
+      similarity:
+        metric: jaccard
+        mode: union
+        weights:
+          reactants: 0.5
+          products: 0.5
+        include_participants: false
+      representative:
+        metric: degree
+
+  - id: red_rxn_merge
+    task: reduction.reaction_lumping_prune
+    inputs:
+      reaction_lumping: "@reaction_lumping"
+    mechanism: ${mechanism.path}
+    params: {}
+
+  - id: val_rop
+    task: reduction.validate
+    inputs:
+      patches:
+        - "@red_rop_k250"
+        - "@red_rop_k200"
+        - "@red_rop_k150"
+        - "@red_rop_k120"
+        - "@red_rop_k100"
+        - "@red_rop_k80"
+        - "@red_rop_k60"
+        - "@red_rop_k50"
+    mechanism: ${mechanism.path}
+    validation:
+      label: rop
+      pipeline: bench_gri30_netbench_validation
+      case_mode: all
+      conditions_file: ${oc.select:benchmarks.validation_conditions_file,benchmarks/assets/conditions/gri30_netbench_val.csv}
+      metric: rel
+      tolerance: 0.5
+      stop_on_fail: false
+      use_multipliers_only: true
+      sim_step_id: sim
+      observables_step_id: observables
+      features_step_id: features
+
+  - id: val_centrality
+    task: reduction.validate
+    inputs:
+      patches:
+        - "@red_cent_k250"
+        - "@red_cent_k200"
+        - "@red_cent_k150"
+        - "@red_cent_k120"
+        - "@red_cent_k100"
+        - "@red_cent_k80"
+        - "@red_cent_k60"
+        - "@red_cent_k50"
+    mechanism: ${mechanism.path}
+    validation:
+      label: centrality
+      pipeline: bench_gri30_netbench_validation
+      case_mode: all
+      conditions_file: ${oc.select:benchmarks.validation_conditions_file,benchmarks/assets/conditions/gri30_netbench_val.csv}
+      metric: rel
+      tolerance: 0.5
+      stop_on_fail: false
+      use_multipliers_only: true
+      sim_step_id: sim
+      observables_step_id: observables
+      features_step_id: features
+
+  - id: val_gnn
+    task: reduction.validate
+    inputs:
+      patches:
+        - "@red_gnn_k250"
+        - "@red_gnn_k200"
+        - "@red_gnn_k150"
+        - "@red_gnn_k120"
+        - "@red_gnn_k100"
+        - "@red_gnn_k80"
+        - "@red_gnn_k60"
+        - "@red_gnn_k50"
+    mechanism: ${mechanism.path}
+    validation:
+      label: gnn
+      pipeline: bench_gri30_netbench_validation
+      case_mode: all
+      conditions_file: ${oc.select:benchmarks.validation_conditions_file,benchmarks/assets/conditions/gri30_netbench_val.csv}
+      metric: rel
+      tolerance: 0.5
+      stop_on_fail: false
+      use_multipliers_only: true
+      sim_step_id: sim
+      observables_step_id: observables
+      features_step_id: features
+
+  - id: val_amore
+    task: reduction.validate
+    inputs:
+      patches: ["@red_amore"]
+    mechanism: ${mechanism.path}
+    validation:
+      label: amore
+      pipeline: bench_gri30_netbench_validation
+      case_mode: all
+      conditions_file: ${oc.select:benchmarks.validation_conditions_file,benchmarks/assets/conditions/gri30_netbench_val.csv}
+      metric: rel
+      tolerance: 0.5
+      stop_on_fail: false
+      use_multipliers_only: true
+      sim_step_id: sim
+      observables_step_id: observables
+      features_step_id: features
+
+  - id: val_learnck
+    task: reduction.validate
+    inputs:
+      patches: ["@red_learnck"]
+    mechanism: ${mechanism.path}
+    validation:
+      label: learnck
+      pipeline: bench_gri30_netbench_validation
+      case_mode: all
+      conditions_file: ${oc.select:benchmarks.validation_conditions_file,benchmarks/assets/conditions/gri30_netbench_val.csv}
+      metric: rel
+      tolerance: 0.5
+      stop_on_fail: false
+      use_multipliers_only: true
+      sim_step_id: sim
+      observables_step_id: observables
+      features_step_id: features
+
+  - id: val_rxn_merge
+    task: reduction.validate
+    inputs:
+      patches: ["@red_rxn_merge"]
+    mechanism: ${mechanism.path}
+    validation:
+      label: reaction_lumping_prune
+      pipeline: bench_gri30_netbench_validation
+      case_mode: all
+      conditions_file: ${oc.select:benchmarks.validation_conditions_file,benchmarks/assets/conditions/gri30_netbench_val.csv}
+      metric: rel
+      tolerance: 0.5
+      stop_on_fail: false
+      use_multipliers_only: true
+      sim_step_id: sim
+      observables_step_id: observables
+      features_step_id: features
+
+  - id: val_state_merge
+    task: reduction.validate
+    inputs:
+      patches: ["@red_state_merge"]
+      mapping_id: "@node_lumping"
+    mechanism: ${mechanism.path}
+    validation:
+      label: node_lumping_prune
+      pipeline: bench_gri30_netbench_validation_superstate
+      case_mode: all
+      conditions_file: ${oc.select:benchmarks.validation_conditions_file,benchmarks/assets/conditions/gri30_netbench_val.csv}
+      metric: rel
+      tolerance: 0.5
+      stop_on_fail: false
+      use_multipliers_only: false
+      sim_step_id: sim
+      features_step_id: qoi
+      inject_inputs:
+        qoi:
+          mapping_id: "$inputs.mapping_id"
+
+  - id: viz
+    task: viz.benchmark_report
+    name: bench_gri30_netbench_reduce_suite
+    dashboard: benchmark
+    chart_backend: svg
+    export_images:
+      enabled: true
+      formats: [svg]
+      dir: images
+    inputs:
+      runs: "@sim"
+      graphs: ["@graph_mech", "@graph_flux"]
+      reduction:
+        - "@red_rop_k250"
+        - "@red_rop_k200"
+        - "@red_rop_k150"
+        - "@red_rop_k120"
+        - "@red_rop_k100"
+        - "@red_rop_k80"
+        - "@red_rop_k60"
+        - "@red_rop_k50"
+        - "@red_cent_k250"
+        - "@red_cent_k200"
+        - "@red_cent_k150"
+        - "@red_cent_k120"
+        - "@red_cent_k100"
+        - "@red_cent_k80"
+        - "@red_cent_k60"
+        - "@red_cent_k50"
+        - "@red_gnn_k250"
+        - "@red_gnn_k200"
+        - "@red_gnn_k150"
+        - "@red_gnn_k120"
+        - "@red_gnn_k100"
+        - "@red_gnn_k80"
+        - "@red_gnn_k60"
+        - "@red_gnn_k50"
+        - "@red_amore"
+        - "@red_learnck"
+        - "@red_rxn_merge"
+        - "@red_state_merge"
+      validation:
+        - "@val_rop"
+        - "@val_centrality"
+        - "@val_gnn"
+        - "@val_amore"
+        - "@val_learnck"
+        - "@val_rxn_merge"
+        - "@val_state_merge"
+    graphviz:
+      top_n: 8
+      max_nodes: 80
+      max_edges: 160
+      engine_bipartite: dot
+      engine_flux: sfdp
+      export_dot: true
+      export_svg: true
+      plots: [top_rop, top_wdot, patch, top_rop_reduced, flux_species]
+    reduction_effect:
+      top_n: 12
+    params: {}
